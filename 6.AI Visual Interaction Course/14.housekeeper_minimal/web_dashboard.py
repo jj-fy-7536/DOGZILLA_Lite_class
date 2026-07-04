@@ -4,8 +4,7 @@
 - 当前阶段、当前表情、任务文本
 - 全流程实时画面(人脸/抓球/找线/巡线各阶段通过 frame_bus 发布)
 - 播报与事件日志
-
-只读展示,不接受控制指令。
+- 停止当前任务按钮
 """
 
 from __future__ import annotations
@@ -16,12 +15,13 @@ import threading
 import time
 from collections import deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from typing import Callable
 
 import frame_bus
 
 
 class StatusBoard:
-    def __init__(self, max_messages: int = 60) -> None:
+    def __init__(self, max_messages: int = 160) -> None:
         self._lock = threading.Lock()
         self._stage = "STARTING"
         self._expression = ""
@@ -67,15 +67,23 @@ _PAGE = """<!DOCTYPE html>
   header h1 { font-size:18px; margin:0; }
   .badge { background:#223041; border-radius:6px; padding:4px 12px; font-size:14px; }
   .badge b { color:#7fd4ff; }
+  .stopbtn { margin-left:auto; border:0; background:#c83f3f; color:#fff; border-radius:6px;
+             padding:7px 14px; font-size:14px; font-weight:700; cursor:pointer; }
+  .stopbtn:active { transform:translateY(1px); }
+  .stopbtn[disabled] { opacity:.55; cursor:not-allowed; }
   main { display:flex; gap:16px; padding:16px 20px; flex-wrap:wrap; }
   .video { flex:2 1 480px; min-width:320px; }
   .video img { width:100%; border-radius:8px; background:#000; display:block; }
-  .log { flex:1 1 300px; min-width:280px; max-height:70vh; overflow-y:auto;
+  .log { flex:1 1 360px; min-width:320px; max-height:70vh; overflow-y:auto;
          background:#161c23; border-radius:8px; padding:10px 14px; font-size:13px; }
-  .log div { padding:3px 0; border-bottom:1px solid #222b35; }
+  .log div { padding:6px 0; border-bottom:1px solid #222b35; line-height:1.45; }
   .log .time { color:#5f7285; margin-right:8px; }
+  .log .tag { display:inline-block; min-width:58px; margin-right:8px; color:#9db0c2; }
+  .log .asr { color:#81d4ff; }
   .log .speak { color:#ffd76e; }
   .log .event { color:#8fd48f; }
+  .log .skip { color:#8795a3; }
+  .log .info { color:#d8e0e8; }
 </style>
 </head>
 <body>
@@ -84,6 +92,7 @@ _PAGE = """<!DOCTYPE html>
   <span class="badge">阶段 <b id="stage">-</b></span>
   <span class="badge">表情 <b id="expression">-</b></span>
   <span class="badge">任务 <b id="task">-</b></span>
+  <button class="stopbtn" id="stopbtn" type="button">停止任务</button>
 </header>
 <main>
   <div class="video"><img src="/stream.mjpg" alt="live"></div>
@@ -98,13 +107,27 @@ async function tick() {
     document.getElementById('expression').textContent = data.expression || '-';
     document.getElementById('task').textContent = data.task || '-';
     const log = document.getElementById('log');
+    const labels = {asr: '我听到', speak: '机器狗说', event: '执行', skip: '忽略', info: '信息'};
+    const esc = s => String(s || '').replace(/[&<>"']/g, ch => ({
+      '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+    }[ch]));
     log.innerHTML = data.messages.slice().reverse().map(m =>
-      `<div><span class="time">${m.time}</span><span class="${m.kind}">${m.text}</span></div>`
+      `<div><span class="time">${esc(m.time)}</span><span class="tag">${labels[m.kind] || esc(m.kind)}</span><span class="${esc(m.kind)}">${esc(m.text)}</span></div>`
     ).join('');
   } catch (e) {}
 }
 setInterval(tick, 1000);
 tick();
+document.getElementById('stopbtn').addEventListener('click', async () => {
+  const btn = document.getElementById('stopbtn');
+  btn.disabled = true;
+  try {
+    await fetch('/stop', {method: 'POST'});
+  } finally {
+    setTimeout(() => { btn.disabled = false; }, 800);
+    tick();
+  }
+});
 </script>
 </body>
 </html>"""
@@ -127,14 +150,16 @@ def _placeholder_jpeg(stage: str) -> bytes:
 
 
 class DashboardServer:
-    def __init__(self, board: StatusBoard, port: int = 8091) -> None:
+    def __init__(self, board: StatusBoard, port: int = 8091, on_stop: Callable[[], None] | None = None) -> None:
         self.board = board
         self.port = port
+        self.on_stop = on_stop
         self._server: ThreadingHTTPServer | None = None
         self._thread: threading.Thread | None = None
 
     def start(self) -> None:
         board = self.board
+        on_stop = self.on_stop
 
         class Handler(BaseHTTPRequestHandler):
             def log_message(self, format, *args):
@@ -148,6 +173,15 @@ class DashboardServer:
                     self._send_bytes(payload.encode("utf-8"), "application/json; charset=utf-8")
                 elif self.path == "/stream.mjpg":
                     self._stream()
+                else:
+                    self.send_error(404)
+
+            def do_POST(self):
+                if self.path == "/stop":
+                    if on_stop is not None:
+                        on_stop()
+                    payload = json.dumps({"ok": True}, ensure_ascii=False)
+                    self._send_bytes(payload.encode("utf-8"), "application/json; charset=utf-8")
                 else:
                     self.send_error(404)
 

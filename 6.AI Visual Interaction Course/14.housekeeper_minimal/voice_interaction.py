@@ -17,6 +17,7 @@ from __future__ import annotations
 import argparse
 import base64
 import datetime
+import html
 import hashlib
 import hmac
 import json
@@ -42,6 +43,8 @@ from wsgiref.handlers import format_date_time
 
 import websocket
 
+from chat_config import resolve_chat_defaults
+
 
 ROBOT_PATHS = ("/home/pi/RaspberryPi-CM5/app", "/home/pi/RaspberryPi-CM5/demos")
 for robot_path in ROBOT_PATHS:
@@ -64,9 +67,10 @@ XFYUN_API_SECRET = os.getenv("XFYUN_API_SECRET", "")
 XFYUN_TTS_APPID = os.getenv("XFYUN_TTS_APPID", XFYUN_APPID)
 XFYUN_TTS_API_KEY = os.getenv("XFYUN_TTS_API_KEY", XFYUN_API_KEY)
 XFYUN_TTS_API_SECRET = os.getenv("XFYUN_TTS_API_SECRET", XFYUN_API_SECRET)
-SPARK_API_PASSWORD = os.getenv("SPARK_API_PASSWORD", "")
-SPARK_API_URL = os.getenv("SPARK_API_URL", "https://spark-api-open.xf-yun.com/v1/chat/completions")
-SPARK_MODEL = os.getenv("SPARK_MODEL", "lite")
+CHAT_DEFAULTS = resolve_chat_defaults()
+SPARK_API_PASSWORD = CHAT_DEFAULTS.api_key
+SPARK_API_URL = CHAT_DEFAULTS.api_url
+SPARK_MODEL = CHAT_DEFAULTS.model
 XFYUN_TTS_VCN = os.getenv("XFYUN_TTS_VCN", "x4_xiaoyan")
 XFYUN_TTS_SPEED = int(os.getenv("XFYUN_TTS_SPEED", "50"))
 XFYUN_TTS_VOLUME = int(os.getenv("XFYUN_TTS_VOLUME", "70"))
@@ -74,10 +78,12 @@ XFYUN_TTS_PITCH = int(os.getenv("XFYUN_TTS_PITCH", "50"))
 XFYUN_TTS_TIMEOUT = float(os.getenv("XFYUN_TTS_TIMEOUT", "10.0"))
 SPARK_SYSTEM_PROMPT = os.getenv(
     "SPARK_SYSTEM_PROMPT",
-    "你是DOGZILLA Lite机器狗的语音助手。请用中文口语化回答，简短自然，适合直接朗读；"
-    "一般不超过80个汉字。不要承诺播放音乐、闹钟、拍照、导航等未接入功能；"
-    "除普通问答、背诗、讲故事、介绍知识外，目前可执行指令只有：坐下、握手、站起来、停止、前进、后退、左转、右转；"
-    "问天气时需要用户说出城市。",
+    "你是DOGZILLA Lite机器狗的语音助手。用中文口语化回答，简短自然，像正常聊天，适合直接朗读；"
+    "一般不超过80个汉字。你可以回答常识、解释概念、背诗、讲故事、天气、比赛、新闻和国际形势；"
+    "如果提示里提供了实时网页搜索结果，必须优先根据搜索结果回答，不要说自己没有实时搜索、没有数据库或不能联网；"
+    "如果搜索结果不足，就说没搜到足够信息，并结合背景知识简短回答，不要叫用户自己去联网查。"
+    "不要承诺闹钟、拍照、导航等未接入功能；机器人动作指令有：坐下、握手、站起来、停止、前进、后退、左转、右转；"
+    "听不清或语义不完整时，只简短追问一句，不要罗列功能菜单。",
 )
 
 STATUS_FIRST_FRAME = 0
@@ -874,6 +880,62 @@ WAKE_WORDS = (
     "你",
 )
 
+WEB_SEARCH_KEYWORDS = (
+    "最新",
+    "最近",
+    "近期",
+    "现在",
+    "今天",
+    "新闻",
+    "实时",
+    "时事",
+    "国际局势",
+    "国际形势",
+    "国际关系",
+    "国际新闻",
+    "局势",
+    "形势",
+    "政治",
+    "外交",
+    "战争",
+    "冲突",
+    "停火",
+    "制裁",
+    "中东",
+    "俄乌",
+    "乌克兰",
+    "俄罗斯",
+    "加沙",
+    "以色列",
+    "伊朗",
+    "美国",
+    "中国",
+    "天气",
+    "气温",
+    "温度",
+    "下雨",
+    "世界杯",
+    "比赛",
+    "比分",
+    "赛况",
+    "股价",
+    "行情",
+    "热搜",
+    "联网",
+    "网络",
+    "对阵",
+    "vs",
+    "几比几",
+    "谁赢",
+    "晋级",
+    "淘汰赛",
+    "阿根廷",
+    "国根廷",
+    "佛得角",
+    "佛德角",
+    "发生了什么",
+)
+
 
 def should_use_spark_chat(text: str, args: argparse.Namespace) -> bool:
     cleaned = clean_text(text)
@@ -883,9 +945,34 @@ def should_use_spark_chat(text: str, args: argparse.Namespace) -> bool:
         return False
     if cleaned in CHAT_IGNORED_TEXTS:
         return False
-    if args.spark_question_only and not (is_question_text(text) or is_directed_request_text(text)):
+    if looks_like_noise_text(text):
+        return False
+    has_chat_intent = (
+        is_question_text(text)
+        or is_directed_request_text(text)
+        or should_use_web_search(text, args)
+    )
+    if not has_chat_intent:
         return False
     return True
+
+
+def looks_like_noise_text(text: str) -> bool:
+    cleaned = clean_text(text)
+    if not cleaned:
+        return True
+    if re.fullmatch(r"[a-z]+", cleaned):
+        return True
+    if re.fullmatch(r"(嗯|啊|哦|额|呃|哈|哼|唉|呀|吧|呢|的)+", cleaned):
+        return True
+    if len(cleaned) <= 3 and not has_any(cleaned, WEB_SEARCH_KEYWORDS):
+        return True
+    counts = {}
+    for ch in cleaned:
+        counts[ch] = counts.get(ch, 0) + 1
+    if counts and max(counts.values()) / max(1, len(cleaned)) >= 0.65:
+        return True
+    return False
 
 
 def is_question_text(text: str) -> bool:
@@ -934,12 +1021,25 @@ def is_recent_duplicate_text(text: str, last_text: str, last_at: float, args: ar
 
 def fetch_spark_answer(question: str, args: argparse.Namespace) -> str:
     if not args.spark_api_password:
-        raise RuntimeError("Missing SPARK_API_PASSWORD")
+        raise RuntimeError("Missing DEEPSEEK_API_KEY or SPARK_API_PASSWORD")
 
     now_text = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
+    web_context = ""
+    if should_use_web_search(question, args):
+        try:
+            web_context = fetch_web_search_context(question, args)
+        except Exception as exc:
+            print("[WEB_SEARCH] error:", repr(exc), flush=True)
+    web_prompt = ""
+    if web_context:
+        web_prompt = (
+            "下面是实时网页搜索结果，请优先依据这些结果回答；如果结果不足，就说明没有搜到足够信息。\n"
+            f"{web_context}\n"
+        )
     speech_prompt = (
         f"{args.spark_system_prompt}\n"
         f"当前时间：{now_text}。\n"
+        f"{web_prompt}"
         f"用户问题：{question}\n"
         "请只输出适合机器狗直接朗读的一段回答，不要解释这些规则。"
     )
@@ -950,6 +1050,8 @@ def fetch_spark_answer(question: str, args: argparse.Namespace) -> str:
         "temperature": args.spark_temperature,
         "max_tokens": args.spark_max_tokens,
     }
+    if "deepseek" in args.spark_api_url:
+        payload["thinking"] = {"type": "disabled"}
     body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
     request = Request(
         args.spark_api_url,
@@ -965,18 +1067,207 @@ def fetch_spark_answer(question: str, args: argparse.Namespace) -> str:
     with urlopen(request, timeout=args.spark_timeout) as response:
         response_payload = json.loads(response.read().decode("utf-8"))
 
+    if response_payload.get("error"):
+        error = response_payload["error"]
+        raise RuntimeError(error.get("message", error) if isinstance(error, dict) else error)
     if response_payload.get("code") not in (None, 0):
         raise RuntimeError(response_payload.get("message", response_payload))
 
     choices = response_payload.get("choices") or []
     if not choices:
-        raise RuntimeError("Spark returned no choices")
+        raise RuntimeError("AI chat provider returned no choices")
 
     message = choices[0].get("message") or {}
     answer = message.get("content", "")
     if not answer:
         answer = choices[0].get("text", "")
+    if not answer:
+        answer = message.get("reasoning_content", "")
+    if not answer:
+        answer = "我搜到了相关内容，但没整理出可靠一句话。你再说一遍具体哪场比赛，我马上查。"
     return compact_tts_text(answer, max_chars=args.spark_max_reply_chars)
+
+
+def should_use_web_search(question: str, args: argparse.Namespace) -> bool:
+    if not getattr(args, "web_search", True):
+        return False
+    cleaned = clean_text(question)
+    if not cleaned:
+        return False
+    return has_any(cleaned, WEB_SEARCH_KEYWORDS)
+
+
+def fetch_web_search_context(question: str, args: argparse.Namespace) -> str:
+    base_url = getattr(args, "web_search_url", "https://s.jina.ai/?q=")
+    timeout = float(getattr(args, "web_search_timeout", 8.0))
+    max_chars = int(getattr(args, "web_search_max_chars", 1800))
+    max_sources = int(getattr(args, "web_search_max_sources", 3))
+    query = normalize_web_search_query(question)
+    urls = build_web_search_urls(query, base_url)
+    errors = []
+    snippets = []
+    for label, url, html_mode in urls:
+        try:
+            request = Request(
+                url,
+                headers={
+                    "Accept": "text/html,text/plain,*/*",
+                    "User-Agent": "Mozilla/5.0 DOGZILLA-Lite/1.0",
+                },
+            )
+            with urlopen(request, timeout=timeout) as response:
+                raw = response.read(200000)
+                encoding = response.headers.get_content_charset() or "utf-8"
+            text = raw.decode(encoding, errors="replace")
+            text = clean_search_html(text) if html_mode else clean_search_text(text)
+            if text:
+                snippets.append("{}搜索结果：{}".format(label, text))
+                if len(snippets) >= max_sources:
+                    break
+        except Exception as exc:
+            errors.append("{}: {!r}".format(label, exc))
+    if snippets:
+        text = "\n".join(snippets)
+        return text[:max_chars].rstrip() + ("..." if len(text) > max_chars else "")
+    raise RuntimeError("; ".join(errors) or "no web search source configured")
+
+
+def normalize_web_search_query(question: str) -> str:
+    query = question.strip()
+    replacements = {
+        "国根廷": "阿根廷",
+        "佛德角": "佛得角",
+        "佛得脚": "佛得角",
+        "世畀杯": "世界杯",
+        "是界杯": "世界杯",
+    }
+    for old, new in replacements.items():
+        query = query.replace(old, new)
+    cleaned = clean_text(query)
+    if "世界杯" in cleaned and "2026" not in query:
+        query = "2026年 " + query
+    return query
+
+
+def build_web_search_urls(question: str, base_url: str) -> list[tuple[str, str, bool]]:
+    queries = build_web_search_queries(question)
+    if base_url and base_url != "auto":
+        return [
+            ("自定义", base_url + quote(query), "s.jina.ai" not in base_url)
+            for query in queries
+        ]
+    urls: list[tuple[str, str, bool]] = []
+    if is_world_cup_search(question):
+        urls.extend(
+            [
+                ("FOX世界杯比分", "https://www.foxsports.com/soccer/fifa-world-cup/scores", True),
+                ("ESPN世界杯赛程", "https://www.espn.com/soccer/schedule/_/league/fifa.world", True),
+                (
+                    "Olympics中文世界杯赛程",
+                    "https://www.olympics.com/zh/news/fifa-world-cup-2026-schedule-results-scores-standings-list",
+                    True,
+                ),
+            ]
+        )
+    for index, query in enumerate(queries, start=1):
+        encoded = quote(query)
+        suffix = "" if len(queries) == 1 else str(index)
+        urls.extend(
+            [
+                ("Bing" + suffix, "https://www.bing.com/search?q=" + encoded, True),
+                ("百度" + suffix, "https://www.baidu.com/s?wd=" + encoded, True),
+                ("Jina" + suffix, "https://s.jina.ai/?q=" + encoded, False),
+            ]
+        )
+    return urls
+
+
+def build_web_search_queries(question: str) -> list[str]:
+    query = question.strip()
+    queries = [query]
+    today = datetime.datetime.now()
+    if is_world_cup_search(query):
+        queries.extend(
+            [
+                "{} FIFA World Cup fixtures scores today".format(today.strftime("%B %-d %Y")),
+                "{}年{}月{}日 世界杯 赛程 比分".format(today.year, today.month, today.day),
+                "2026 FIFA World Cup schedule scores round of 16",
+            ]
+        )
+    elif is_global_news_search(query):
+        queries.extend(
+            [
+                "{} 国际局势 最新 新闻".format(today.strftime("%Y-%m-%d")),
+                "{} global news international situation latest".format(today.strftime("%B %-d %Y")),
+                "近期 国际形势 俄乌 中东 加沙 伊朗 美国 中国 最新",
+            ]
+        )
+    elif has_any(clean_text(query), ("今天", "现在", "实时", "最新")):
+        queries.append("{} {}".format(today.strftime("%Y-%m-%d"), query))
+    unique = []
+    seen = set()
+    for item in queries:
+        normalized = item.strip()
+        if normalized and normalized not in seen:
+            seen.add(normalized)
+            unique.append(normalized)
+    return unique
+
+
+def is_world_cup_search(question: str) -> bool:
+    cleaned = clean_text(question).lower()
+    return "世界杯" in cleaned or "worldcup" in cleaned or "fifaworldcup" in cleaned
+
+
+def is_global_news_search(question: str) -> bool:
+    cleaned = clean_text(question)
+    return has_any(
+        cleaned,
+        (
+            "国际局势",
+            "国际形势",
+            "国际关系",
+            "国际新闻",
+            "世界局势",
+            "世界形势",
+            "时事",
+            "中东",
+            "俄乌",
+            "加沙",
+            "战争",
+            "冲突",
+        ),
+    )
+
+
+def clean_search_text(text: str) -> str:
+    text = re.sub(r"\s+", " ", text)
+    return text.strip()
+
+
+def clean_search_html(text: str) -> str:
+    if "百度安全验证" in text:
+        return ""
+    result_start = text.find('<li class="b_algo"')
+    if result_start >= 0:
+        text = text[result_start:]
+        result_end = text.find("</ol>")
+        if result_end > 0:
+            text = text[:result_end]
+    text = re.sub(r"(?is)<script.*?</script>", " ", text)
+    text = re.sub(r"(?is)<style.*?</style>", " ", text)
+    text = re.sub(r"(?is)<noscript.*?</noscript>", " ", text)
+    text = re.sub(r"(?s)<[^>]+>", " ", text)
+    text = html.unescape(text)
+    text = re.sub(r"\s+", " ", text)
+    junk = (
+        "javascript",
+        "cookie",
+        "隐私",
+        "广告",
+    )
+    parts = [part for part in text.split(" ") if part and not any(word in part.lower() for word in junk)]
+    return " ".join(parts).strip()
 
 
 def compact_tts_text(text: str, max_chars: int) -> str:
@@ -1194,16 +1485,11 @@ def parse_command(text: str) -> Command | None:
         return Command("handshake", "收到，握手")
     if has_any(text, ("站起来", "起立", "站立", "恢复", "复位", "起来")):
         return Command("stand", "收到，站起来")
-    if is_weather_request(text):
-        city = extract_weather_city(text)
-        if city:
-            return Command("weather", text=city)
-        return Command("say", text="你想问哪个城市的天气？")
 
     if has_any(text, ("你是谁", "你叫什么", "介绍自己", "介绍一下自己")):
         return Command("say", text="我是DOGZILLA Lite机器狗，可以坐下、握手、走动，也可以回答简单问题。")
     if has_any(text, ("你会什么", "能做什么", "有什么功能")):
-        return Command("say", text="我现在会坐下、握手、站起来、停止、前进、后退、左右转、查指定城市天气，也能背诗和回答简单问题。")
+        return Command("say", text="我现在会坐下、握手、站起来、停止、前进、后退、左右转，也能回答天气、新闻和简单问题。")
     if has_any(text, ("几点", "现在时间", "当前时间", "报时")):
         return Command("time", "")
 
@@ -1233,13 +1519,6 @@ def execute_command(robot: DogzillaVoiceRobot, command: Command, args: argparse.
         robot.action(19, seconds=args.action_seconds)
     elif name == "stand":
         robot.action(2, seconds=2.0)
-    elif name == "weather":
-        try:
-            report = fetch_weather_report(args, city=command.text)
-        except Exception as exc:
-            print("[WEATHER] error:", repr(exc), flush=True)
-            report = "天气查询失败"
-        robot.speak(report)
     elif name == "say":
         robot.speak(command.text)
     elif name == "time":
@@ -1249,7 +1528,7 @@ def execute_command(robot: DogzillaVoiceRobot, command: Command, args: argparse.
         try:
             answer = fetch_spark_answer(command.text, args)
         except Exception as exc:
-            print("[SPARK] error:", repr(exc), flush=True)
+            print("[CHAT] error:", repr(exc), flush=True)
             answer = "这个问题我暂时回答失败了"
         robot.speak(answer)
     elif name == "music_play":
@@ -1326,22 +1605,29 @@ def build_parser() -> argparse.ArgumentParser:
         "--spark-chat",
         action=argparse.BooleanOptionalAction,
         default=True,
-        help="answer non-command speech with Spark Lite when SPARK_API_PASSWORD is set",
+        help="answer non-command speech with DeepSeek or Spark when an API key is set",
     )
     parser.add_argument("--spark-api-password", default=SPARK_API_PASSWORD)
     parser.add_argument("--spark-api-url", default=SPARK_API_URL)
     parser.add_argument("--spark-model", default=SPARK_MODEL)
+    parser.add_argument("--deepseek-api-key", dest="spark_api_password", default=argparse.SUPPRESS)
+    parser.add_argument("--deepseek-api-url", dest="spark_api_url", default=argparse.SUPPRESS)
+    parser.add_argument("--deepseek-model", dest="spark_model", default=argparse.SUPPRESS)
     parser.add_argument("--spark-system-prompt", default=SPARK_SYSTEM_PROMPT)
     parser.add_argument("--spark-temperature", type=float, default=0.5)
-    parser.add_argument("--spark-max-tokens", type=int, default=160)
-    parser.add_argument("--spark-timeout", type=float, default=8.0)
-    parser.add_argument("--spark-max-reply-chars", type=int, default=90)
+    parser.add_argument("--spark-max-tokens", type=int, default=320)
+    parser.add_argument("--spark-timeout", type=float, default=15.0)
+    parser.add_argument("--spark-max-reply-chars", type=int, default=160)
     parser.add_argument("--spark-min-chars", type=int, default=3)
+    parser.add_argument("--web-search", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--web-search-url", default=os.getenv("DOGZILLA_WEB_SEARCH_URL", "auto"))
+    parser.add_argument("--web-search-timeout", type=float, default=float(os.getenv("DOGZILLA_WEB_SEARCH_TIMEOUT", "8.0")))
+    parser.add_argument("--web-search-max-chars", type=int, default=int(os.getenv("DOGZILLA_WEB_SEARCH_MAX_CHARS", "1800")))
     parser.add_argument(
         "--spark-question-only",
         action=argparse.BooleanOptionalAction,
-        default=True,
-        help="only send clear questions or directed requests to Spark; ordinary speech is ignored",
+        default=False,
+        help="only send clear questions or directed requests to AI chat; ordinary speech is ignored",
     )
     parser.add_argument("--tts-echo-ignore-seconds", type=float, default=5.0)
     parser.add_argument("--tts-echo-similarity", type=float, default=0.72)

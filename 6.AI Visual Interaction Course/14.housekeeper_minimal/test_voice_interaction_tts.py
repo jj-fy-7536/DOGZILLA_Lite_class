@@ -2,12 +2,14 @@ import base64
 import importlib.util
 import sys
 import tempfile
+import types
 import unittest
 import wave
 from pathlib import Path
 
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+sys.modules.setdefault("websocket", types.SimpleNamespace(WebSocketApp=object))
 
 MODULE_PATH = Path(__file__).with_name("voice_interaction.py")
 SPEC = importlib.util.spec_from_file_location("voice_interaction", MODULE_PATH)

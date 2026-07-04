@@ -16,6 +16,7 @@ import time
 from pathlib import Path
 from typing import Callable, NamedTuple
 
+from chat_config import resolve_chat_defaults
 from echo_guard import EchoGuard
 from expression_feedback import ExpressionDisplay
 from housekeeper_config import ConfigError, HousekeeperConfig, load_config
@@ -26,8 +27,10 @@ ROBOT_PYTHON = Path("/home/pi/RaspberryPi-CM5/xgovenv/bin/python")
 DEFAULT_ROBOT_IP = "172.20.10.9"
 DEFAULT_MUSIC_PLAYER = Path("/home/pi/dogzilla_runs/dogzilla_music_player.py")
 DEFAULT_MUSIC_DIR = Path("/home/pi/dogzilla_runs/music")
-DEFAULT_SPARK_API_URL = "https://spark-api-open.xf-yun.com/v1/chat/completions"
-DEFAULT_SPARK_MODEL = "lite"
+CHAT_DEFAULTS = resolve_chat_defaults()
+DEFAULT_CHAT_API_KEY = CHAT_DEFAULTS.api_key
+DEFAULT_SPARK_API_URL = CHAT_DEFAULTS.api_url
+DEFAULT_SPARK_MODEL = CHAT_DEFAULTS.model
 DEFAULT_TTS_BACKEND = os.getenv("DOGZILLA_TTS_BACKEND", "xunfei")
 DEFAULT_TTS_APPID = os.getenv("XFYUN_TTS_APPID", os.getenv("XFYUN_APPID", ""))
 DEFAULT_TTS_API_KEY = os.getenv("XFYUN_TTS_API_KEY", os.getenv("XFYUN_API_KEY", ""))
@@ -38,10 +41,12 @@ DEFAULT_TTS_VOLUME = int(os.getenv("XFYUN_TTS_VOLUME", "70"))
 DEFAULT_TTS_PITCH = int(os.getenv("XFYUN_TTS_PITCH", "50"))
 DEFAULT_TTS_TIMEOUT = float(os.getenv("XFYUN_TTS_TIMEOUT", "10.0"))
 DEFAULT_SPARK_SYSTEM_PROMPT = (
-    "你是DOGZILLA Lite机器狗的语音助手。请用中文口语化回答，简短自然，适合直接朗读；"
-    "一般不超过80个汉字。不要承诺播放音乐、闹钟、拍照、导航等未接入功能；"
-    "除普通问答、背诗、讲故事、介绍知识外，目前可执行指令只有：坐下、握手、站起来、停止、前进、后退、左转、右转；"
-    "问天气时需要用户说出城市。"
+    "你是DOGZILLA Lite机器狗的语音助手。用中文口语化回答，简短自然，像正常聊天，适合直接朗读；"
+    "一般不超过80个汉字。你可以回答常识、解释概念、背诗、讲故事、天气、比赛、新闻和国际形势；"
+    "如果提示里提供了实时网页搜索结果，必须优先根据搜索结果回答，不要说自己没有实时搜索、没有数据库或不能联网；"
+    "如果搜索结果不足，就说没搜到足够信息，并结合背景知识简短回答，不要叫用户自己去联网查。"
+    "不要承诺闹钟、拍照、导航等未接入功能；机器人动作指令有：坐下、握手、站起来、停止、前进、后退、左转、右转；"
+    "听不清或语义不完整时，只简短追问一句，不要罗列功能菜单。"
 )
 
 AUTH_RESULT_PATH = Path("/home/pi/xgoPictures/housekeeper/auth_result.json")
@@ -49,6 +54,7 @@ GRAB_RESULT_PATH = Path("/home/pi/xgoPictures/ball_grab/grab_result.json")
 
 EXIT_AUTH_FAILED = 10
 EXIT_NO_TASK = 11
+EXIT_STOPPED = 12
 
 TASK_TRIGGER_KEYWORDS = (
     "开始任务",
@@ -98,6 +104,12 @@ MUSIC_STOP_KEYWORDS = (
     "别放了",
 )
 SUPPORTED_MUSIC_EXTENSIONS = {".mp3", ".wav", ".m4a", ".aac", ".flac", ".ogg"}
+TASK_STOP_PROCESS_PATTERNS = (
+    "grab_then_follow_line.py",
+    "ball_grab_v3.py",
+    "find_and_align_line.py",
+    "follow_line.py",
+)
 
 
 class HousekeeperTask(NamedTuple):
@@ -237,7 +249,7 @@ def answer_voice_chat(text: str, args: argparse.Namespace, speaker: object | Non
     try:
         answer = voice_module.fetch_spark_answer(text, args)
     except Exception as exc:
-        print("[SPARK] error: {!r}".format(exc), flush=True)
+        print("[CHAT] error: {!r}".format(exc), flush=True)
         answer = "这个问题我暂时回答失败了"
     speak(speaker, answer)
     return True
@@ -351,6 +363,14 @@ def show_expression(speaker: object | None, expression: str) -> None:
     method = getattr(speaker, "show", None)
     if callable(method):
         method(expression)
+
+
+def add_status_message(speaker: object | None, text: str, kind: str = "info") -> None:
+    if not text:
+        return
+    board = getattr(speaker, "board", None)
+    if board is not None:
+        board.add_message(text, kind=kind)
 
 
 def set_stage(speaker: object | None, stage: str) -> None:
@@ -544,8 +564,41 @@ def run_music_command(
     return code
 
 
+def stop_music_silent(
+    args: argparse.Namespace,
+    *,
+    runner: Callable[..., subprocess.CompletedProcess] = subprocess.run,
+) -> int:
+    command = build_music_player_command(
+        args.python,
+        args.music_player,
+        music_dir=args.music_dir,
+        song=args.music_song,
+        volume=args.music_volume,
+        loop=args.music_loop,
+        action="stop",
+    )
+    print("\n=== MUSIC_STOP_SILENT ===", flush=True)
+    print("COMMAND: {}".format(" ".join(command)), flush=True)
+    try:
+        result = runner(command, env=build_child_env(), timeout=args.music_timeout, check=False)
+    except Exception as exc:
+        print("[MUSIC] silent stop failed: {!r}".format(exc), flush=True)
+        return 1
+    return int(getattr(result, "returncode", 1))
+
+
 def _format_seconds(value: float) -> str:
     return str(int(value)) if float(value).is_integer() else str(value)
+
+
+def _send_process_tree_signal(process: subprocess.Popen[str], sig: int) -> None:
+    try:
+        os.killpg(process.pid, sig)
+    except ProcessLookupError:
+        return
+    except Exception:
+        process.send_signal(sig)
 
 
 def terminate_process(process: subprocess.Popen[str], *, grace_seconds: float = 3.0) -> bool:
@@ -557,15 +610,15 @@ def terminate_process(process: subprocess.Popen[str], *, grace_seconds: float = 
     if process.poll() is not None:
         return True
     try:
-        process.send_signal(signal.SIGINT)
+        _send_process_tree_signal(process, signal.SIGINT)
         process.wait(timeout=grace_seconds)
         return True
     except subprocess.TimeoutExpired:
-        process.terminate()
+        _send_process_tree_signal(process, signal.SIGTERM)
         try:
             process.wait(timeout=grace_seconds)
         except subprocess.TimeoutExpired:
-            process.kill()
+            _send_process_tree_signal(process, signal.SIGKILL)
             process.wait()
         return False
 
@@ -574,7 +627,7 @@ _stop_dog = None
 _stop_dog_lock = threading.Lock()
 
 
-def stop_robot_motion(*, serial_settle_seconds: float = 0.0) -> None:
+def stop_robot_motion(*, serial_settle_seconds: float = 0.0, cycles: int = 4) -> None:
     """父进程兜底停狗。串口实例缓存复用,避免反复开关串口。"""
     global _stop_dog
     if serial_settle_seconds > 0:
@@ -585,7 +638,7 @@ def stop_robot_motion(*, serial_settle_seconds: float = 0.0) -> None:
         with _stop_dog_lock:
             if _stop_dog is None:
                 _stop_dog = XGO(port="/dev/ttyAMA0", version="xgolite")
-            for _ in range(4):
+            for _ in range(max(1, int(cycles))):
                 _stop_dog.move("x", 0)
                 _stop_dog.move("y", 0)
                 _stop_dog.turn(0)
@@ -594,6 +647,65 @@ def stop_robot_motion(*, serial_settle_seconds: float = 0.0) -> None:
     except Exception as exc:
         _stop_dog = None
         print("[STOP] robot stop failed: {!r}".format(exc), flush=True)
+
+
+def _pgrep(pattern: str) -> list[int]:
+    try:
+        result = subprocess.run(
+            ["pgrep", "-f", pattern],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except Exception as exc:
+        print("[STOP] pgrep failed for {}: {!r}".format(pattern, exc), flush=True)
+        return []
+    pids = []
+    current_pid = os.getpid()
+    for token in result.stdout.split():
+        try:
+            pid = int(token)
+        except ValueError:
+            continue
+        if pid != current_pid:
+            pids.append(pid)
+    return pids
+
+
+def kill_task_subprocesses(*, grace_seconds: float = 1.0) -> int:
+    """兜底清理抓球/巡线残留进程,用于网页按钮和语音急停。"""
+    killed: set[int] = set()
+    for pattern in TASK_STOP_PROCESS_PATTERNS:
+        for pid in _pgrep(pattern):
+            try:
+                print("[STOP] TERM {} pid {}".format(pattern, pid), flush=True)
+                os.kill(pid, signal.SIGTERM)
+                killed.add(pid)
+            except ProcessLookupError:
+                pass
+            except Exception as exc:
+                print("[STOP] TERM failed pid {}: {!r}".format(pid, exc), flush=True)
+    if killed and grace_seconds > 0:
+        time.sleep(grace_seconds)
+    for pattern in TASK_STOP_PROCESS_PATTERNS:
+        for pid in _pgrep(pattern):
+            try:
+                print("[STOP] KILL {} pid {}".format(pattern, pid), flush=True)
+                os.kill(pid, signal.SIGKILL)
+                killed.add(pid)
+            except ProcessLookupError:
+                pass
+            except Exception as exc:
+                print("[STOP] KILL failed pid {}: {!r}".format(pid, exc), flush=True)
+    return len(killed)
+
+
+def emergency_stop_everything(args: argparse.Namespace, controller: "RuntimeController") -> None:
+    """和外部手动“停止”一致:停任务、停音乐、兜底停狗。"""
+    controller.request_stop(speak_feedback=False)
+    kill_task_subprocesses()
+    stop_music_silent(args)
+    stop_robot_motion(cycles=8)
 
 
 class RuntimeController:
@@ -616,15 +728,17 @@ class RuntimeController:
             if self._current_process is process:
                 self._current_process = None
 
-    def request_stop(self) -> None:
+    def request_stop(self, *, speak_feedback: bool = True) -> None:
         with self._lock:
             self._stop_generation += 1
             process = self._current_process
-            already_paused = self._paused.is_set()
-            self._paused.set()
-        if not already_paused:
-            speak(self.speaker, "已暂停")
-            show_expression(self.speaker, "pause")
+            self._paused.clear()
+        with self._task_condition:
+            self._pending_task = None
+            self._task_condition.notify_all()
+        if speak_feedback:
+            speak(self.speaker, "已停止")
+        show_expression(self.speaker, "pause")
         graceful = True
         if process is not None:
             graceful = terminate_process(process)
@@ -642,6 +756,10 @@ class RuntimeController:
             self._pending_task = task
             self._task_condition.notify_all()
 
+    def has_active_process(self) -> bool:
+        with self._lock:
+            return self._current_process is not None and self._current_process.poll() is None
+
     def wait_for_task(self, timeout_seconds: float) -> HousekeeperTask | None:
         deadline = time.time() + timeout_seconds
         with self._task_condition:
@@ -658,9 +776,14 @@ class RuntimeController:
         while self._paused.is_set():
             time.sleep(0.2)
 
-    def mark_stop_handled(self) -> bool:
+    def stop_generation(self) -> int:
         with self._lock:
-            if self._stop_generation <= self._handled_stop_generation:
+            return self._stop_generation
+
+    def mark_stop_handled(self, *, since_generation: int = 0) -> bool:
+        with self._lock:
+            handled_generation = max(self._handled_stop_generation, since_generation)
+            if self._stop_generation <= handled_generation:
                 return False
             self._handled_stop_generation = self._stop_generation
             return True
@@ -680,6 +803,18 @@ class VoiceEventMonitor:
         self.config = config or HousekeeperConfig.default()
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
+        self._dog = None
+
+    def _parse_stream_event(self, text: str) -> VoiceEvent | None:
+        event = parse_voice_event(text, self.config)
+        if event is not None:
+            return event
+        import voice_interaction
+
+        command = voice_interaction.parse_command(text)
+        if command is None or command.name in ("music_play", "music_stop", "chat"):
+            return None
+        return VoiceEvent("builtin", command, text)
 
     def start(self) -> None:
         if self.args.disable_voice_control:
@@ -689,7 +824,7 @@ class VoiceEventMonitor:
             print("[VOICE] missing Xunfei credentials; voice events disabled", flush=True)
             return
         if getattr(self.args, "spark_chat", True) and not getattr(self.args, "spark_api_password", ""):
-            print("[SPARK] missing SPARK_API_PASSWORD; voice Q&A disabled", flush=True)
+            print("[CHAT] missing DEEPSEEK_API_KEY or SPARK_API_PASSWORD; voice Q&A disabled", flush=True)
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
 
@@ -710,7 +845,7 @@ class VoiceEventMonitor:
         while not self._stop.is_set():
             try:
                 text, event = recognizer.stream_until_command(
-                    lambda text: parse_voice_event(text, self.config),
+                    self._parse_stream_event,
                     rate=self.args.stream_rate,
                     fmt=self.args.stream_format,
                     device=self.args.stream_device,
@@ -727,26 +862,142 @@ class VoiceEventMonitor:
                 continue
             if text:
                 print("[ASR] {}".format(text), flush=True)
+                add_status_message(self.controller.speaker, text, kind="asr")
             if self.echo_guard is not None and self.echo_guard.is_echo(text):
                 print("[VOICE] ignored self-echo: {}".format(text), flush=True)
+                add_status_message(self.controller.speaker, "忽略回声: {}".format(text), kind="skip")
+                continue
+            if self.controller.has_active_process():
+                if event is not None and event.kind == "control" and event.value == "stop":
+                    self._stop_everything("语音停止")
+                else:
+                    add_status_message(self.controller.speaker, "任务中静默: {}".format(text), kind="skip")
                 continue
             if event is None:
-                answer_voice_chat(
+                if self._execute_builtin_voice_command(voice_interaction, text):
+                    continue
+                handled = answer_voice_chat(
                     text,
                     self.args,
                     self.controller.speaker,
                     voice_module=voice_interaction,
                 )
+                if not handled:
+                    add_status_message(self.controller.speaker, "噪音过滤: {}".format(text), kind="skip")
                 continue
             if event.kind == "control" and event.value == "stop":
-                self.controller.request_stop()
+                self._stop_everything("语音停止")
             elif event.kind == "control" and event.value == "continue":
+                add_status_message(self.controller.speaker, "继续任务", kind="event")
                 self.controller.request_continue()
             elif event.kind == "task" and isinstance(event.value, HousekeeperTask):
                 print("Task heard from always-on voice: {}".format(event.value.summary()), flush=True)
+                add_status_message(self.controller.speaker, "任务: {}".format(event.value.summary()), kind="event")
                 self.controller.request_task(event.value)
             elif event.kind == "music" and isinstance(event.value, str):
+                add_status_message(self.controller.speaker, "音乐: {}".format(event.value), kind="event")
                 run_music_command(event.value, self.args, speaker=self.controller.speaker)
+            elif event.kind == "builtin":
+                self._execute_builtin_voice_command(voice_interaction, text, command=event.value)
+
+    def _stop_everything(self, source: str) -> None:
+        add_status_message(self.controller.speaker, "{}: 停止所有任务".format(source), kind="event")
+        emergency_stop_everything(self.args, self.controller)
+
+    def _execute_builtin_voice_command(self, voice_module, text: str, command=None) -> bool:
+        command = command or voice_module.parse_command(text)
+        if command is None:
+            return False
+        name = command.name
+        if name in ("music_play", "music_stop", "chat"):
+            return False
+        if self.controller.has_active_process() and name != "stop":
+            add_status_message(self.controller.speaker, "任务中静默: {}".format(text), kind="skip")
+            return True
+        add_status_message(self.controller.speaker, "命令: {}".format(name), kind="event")
+        if name == "stop":
+            self._stop_everything("语音停止")
+        elif command.reply:
+            speak(self.controller.speaker, command.reply)
+        if name == "stop":
+            return True
+        if name == "sit":
+            self._run_action(12, self.args.action_seconds)
+        elif name == "handshake":
+            self._run_action(19, self.args.action_seconds)
+        elif name == "stand":
+            self._run_action(2, 2.0)
+        elif name == "say":
+            speak(self.controller.speaker, command.text)
+        elif name == "time":
+            now = time.localtime()
+            speak(self.controller.speaker, "现在是{}点{:02d}分。".format(now.tm_hour, now.tm_min))
+        elif name == "forward":
+            self._move_x(self.args.move_speed, self.args.move_seconds)
+        elif name == "backward":
+            self._move_x(-self.args.move_speed, self.args.move_seconds)
+        elif name == "left":
+            self._turn(self.args.move_speed, self.args.move_seconds)
+        elif name == "right":
+            self._turn(-self.args.move_speed, self.args.move_seconds)
+        else:
+            return False
+        return True
+
+    def _get_dog(self):
+        if self._dog is None:
+            from xgolib import XGO
+
+            try:
+                self._dog = XGO(port="/dev/ttyAMA0", version="xgolite")
+            except TypeError:
+                self._dog = XGO("xgolite")
+        return self._dog
+
+    def _run_action(self, action_id: int, seconds: float) -> None:
+        if self.controller.has_active_process():
+            speak(self.controller.speaker, "任务执行中，先说停止再控制动作")
+            return
+        try:
+            self._stop_motion()
+            self._get_dog().action(action_id)
+            time.sleep(seconds)
+        except Exception as exc:
+            print("[VOICE_ACTION] failed: {!r}".format(exc), flush=True)
+            speak(self.controller.speaker, "动作执行失败")
+
+    def _move_x(self, speed: int, seconds: float) -> None:
+        if self.controller.has_active_process():
+            speak(self.controller.speaker, "任务执行中，先说停止再控制动作")
+            return
+        try:
+            self._get_dog().move("x", int(speed))
+            time.sleep(seconds)
+            self._stop_motion()
+        except Exception as exc:
+            print("[VOICE_MOVE] failed: {!r}".format(exc), flush=True)
+            speak(self.controller.speaker, "动作执行失败")
+
+    def _turn(self, speed: int, seconds: float) -> None:
+        if self.controller.has_active_process():
+            speak(self.controller.speaker, "任务执行中，先说停止再控制动作")
+            return
+        try:
+            self._get_dog().turn(int(speed))
+            time.sleep(seconds)
+            self._stop_motion()
+        except Exception as exc:
+            print("[VOICE_TURN] failed: {!r}".format(exc), flush=True)
+            speak(self.controller.speaker, "动作执行失败")
+
+    def _stop_motion(self) -> None:
+        dog = self._get_dog()
+        for _ in range(4):
+            dog.move("x", 0)
+            dog.move("y", 0)
+            dog.turn(0)
+            dog.stop()
+            time.sleep(0.04)
 
 
 VoiceControlMonitor = VoiceEventMonitor
@@ -780,6 +1031,7 @@ def wait_for_owner_auth(
         stderr=subprocess.STDOUT,
         text=True,
         bufsize=1,
+        start_new_session=True,
     )
     selector = selectors.DefaultSelector()
     assert process.stdout is not None
@@ -910,21 +1162,13 @@ def run_grab_workflow(
     controller: RuntimeController | None = None,
     grab_result: Path = GRAB_RESULT_PATH,
 ) -> int:
-    current_command = list(command)
-    while True:
-        if controller is not None:
-            controller.wait_while_paused()
-        code = _run_grab_workflow_once(current_command, cwd=cwd, speaker=speaker, controller=controller)
-        if controller is not None and controller.mark_stop_handled():
-            controller.wait_while_paused()
-            resumed = augment_command_for_resume(command, grab_result)
-            if "--skip-grab" in resumed and "--skip-grab" not in command:
-                speak(speaker, "球还在爪里，直接继续找线")
-            else:
-                speak(speaker, "重新开始捡球任务")
-            current_command = resumed
-            continue
-        return code
+    start_stop_generation = controller.stop_generation() if controller is not None else 0
+    if controller is not None:
+        controller.wait_while_paused()
+    code = _run_grab_workflow_once(command, cwd=cwd, speaker=speaker, controller=controller)
+    if controller is not None and controller.mark_stop_handled(since_generation=start_stop_generation):
+        return EXIT_STOPPED
+    return code
 
 
 def _run_grab_workflow_once(
@@ -944,6 +1188,7 @@ def _run_grab_workflow_once(
         stderr=subprocess.STDOUT,
         text=True,
         bufsize=1,
+        start_new_session=True,
     )
     if controller is not None:
         controller.set_process(process)
@@ -955,7 +1200,8 @@ def _run_grab_workflow_once(
             message = workflow_feedback_for_line(line)
             if message and message not in spoken_messages:
                 spoken_messages.add(message)
-                speak(speaker, message)
+                if speaker is not None:
+                    speak(speaker, message)
         return process.wait()
     except KeyboardInterrupt:
         terminate_process(process)
@@ -970,6 +1216,7 @@ def run_sequence(
     listen_for_task: Callable[[], HousekeeperTask | None],
     run_task: Callable[[HousekeeperTask], int],
     speaker: object | None = None,
+    quiet_during_task: bool = False,
 ) -> int:
     set_stage(speaker, "FACE_AUTH")
     show_expression(speaker, "scan")
@@ -980,30 +1227,49 @@ def run_sequence(
         return EXIT_AUTH_FAILED
     show_expression(speaker, "happy")
     speak(speaker, "人脸识别成功")
-    set_stage(speaker, "LISTEN")
-    show_expression(speaker, "listen")
-    speak(speaker, "开始听语音指令")
-    task = listen_for_task()
-    if task is None:
-        show_expression(speaker, "fail")
-        speak(speaker, "没有收到任务")
-        return EXIT_NO_TASK
-    set_stage(speaker, "TASK")
-    show_expression(speaker, "work")
-    notice = task.capability_notice()
-    if notice:
-        speak(speaker, notice)
-    speak(speaker, task.spoken_summary())
-    speak(speaker, "开始执行捡球任务")
-    code = run_task(task)
-    set_stage(speaker, "DONE")
-    if code == 0:
-        show_expression(speaker, "success")
-        speak(speaker, "任务完成")
-    else:
-        show_expression(speaker, "fail")
-        speak(speaker, "任务失败")
-    return code
+    listen_announced = False
+    while True:
+        set_stage(speaker, "LISTEN")
+        show_expression(speaker, "listen")
+        if listen_announced:
+            add_status_message(speaker, "等待新任务", kind="event")
+        else:
+            speak(speaker, "开始听语音指令")
+            listen_announced = True
+        task = listen_for_task()
+        if task is None:
+            show_expression(speaker, "fail")
+            speak(speaker, "没有收到任务")
+            return EXIT_NO_TASK
+        set_stage(speaker, "TASK")
+        show_expression(speaker, "work")
+        notice = task.capability_notice()
+        if quiet_during_task:
+            add_status_message(speaker, "开始执行任务: {}".format(task.summary()), kind="event")
+        else:
+            if notice:
+                speak(speaker, notice)
+            speak(speaker, task.spoken_summary())
+            speak(speaker, "开始执行捡球任务")
+        code = run_task(task)
+        if code == EXIT_STOPPED:
+            show_expression(speaker, "listen")
+            add_status_message(speaker, "任务已停止，等待新任务", kind="event")
+            continue
+        set_stage(speaker, "DONE")
+        if code == 0:
+            show_expression(speaker, "success")
+            if quiet_during_task:
+                add_status_message(speaker, "任务完成", kind="event")
+            else:
+                speak(speaker, "任务完成")
+        else:
+            show_expression(speaker, "fail")
+            if quiet_during_task:
+                add_status_message(speaker, "任务失败", kind="event")
+            else:
+                speak(speaker, "任务失败")
+        return code
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -1023,12 +1289,27 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--target-color", default="", help="调试用:覆盖实际执行颜色")
     parser.add_argument("--face-arg", action="append", default=[], help="透传给 face_interaction.py")
     parser.add_argument("--grab-workflow-arg", action="append", default=[], help="透传给 grab_then_follow_line.py")
+    parser.add_argument(
+        "--quiet-during-task",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="执行抓球/巡线任务时不语音回答，只在仪表盘记录",
+    )
     parser.add_argument("--music-player", type=Path, default=DEFAULT_MUSIC_PLAYER)
     parser.add_argument("--music-dir", type=Path, default=DEFAULT_MUSIC_DIR)
     parser.add_argument("--music-song", default="", help="默认播放歌曲名或关键词；空表示播放目录第一首")
     parser.add_argument("--music-volume", type=int, default=85)
     parser.add_argument("--music-loop", action="store_true")
     parser.add_argument("--music-timeout", type=float, default=8.0)
+    parser.add_argument("--voice-reply", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--action-seconds", type=float, default=3.0)
+    parser.add_argument("--move-speed", type=int, default=12)
+    parser.add_argument("--move-seconds", type=float, default=1.2)
+    parser.add_argument("--weather-city", default=os.getenv("DOGZILLA_WEATHER_CITY", ""))
+    parser.add_argument("--weather-city-label", default=os.getenv("DOGZILLA_WEATHER_CITY_LABEL", ""))
+    parser.add_argument("--weather-lat", type=float, default=os.getenv("DOGZILLA_WEATHER_LAT"))
+    parser.add_argument("--weather-lon", type=float, default=os.getenv("DOGZILLA_WEATHER_LON"))
+    parser.add_argument("--weather-timeout", type=float, default=5.0)
     parser.add_argument("--stream-rate", type=int, default=16000)
     parser.add_argument("--stream-format", default="S16_LE")
     parser.add_argument("--stream-device", default="")
@@ -1050,25 +1331,32 @@ def build_parser() -> argparse.ArgumentParser:
         "--spark-chat",
         action=argparse.BooleanOptionalAction,
         default=True,
-        help="对非任务问句/请求启用 Spark Lite 问答",
+        help="对非任务问句/请求启用 DeepSeek 或 Spark 问答",
     )
-    parser.add_argument("--spark-api-password", default=os.getenv("SPARK_API_PASSWORD", ""))
-    parser.add_argument("--spark-api-url", default=os.getenv("SPARK_API_URL", DEFAULT_SPARK_API_URL))
-    parser.add_argument("--spark-model", default=os.getenv("SPARK_MODEL", DEFAULT_SPARK_MODEL))
+    parser.add_argument("--spark-api-password", default=DEFAULT_CHAT_API_KEY)
+    parser.add_argument("--spark-api-url", default=DEFAULT_SPARK_API_URL)
+    parser.add_argument("--spark-model", default=DEFAULT_SPARK_MODEL)
+    parser.add_argument("--deepseek-api-key", dest="spark_api_password", default=argparse.SUPPRESS)
+    parser.add_argument("--deepseek-api-url", dest="spark_api_url", default=argparse.SUPPRESS)
+    parser.add_argument("--deepseek-model", dest="spark_model", default=argparse.SUPPRESS)
     parser.add_argument(
         "--spark-system-prompt",
         default=os.getenv("SPARK_SYSTEM_PROMPT", DEFAULT_SPARK_SYSTEM_PROMPT),
     )
     parser.add_argument("--spark-temperature", type=float, default=0.5)
-    parser.add_argument("--spark-max-tokens", type=int, default=160)
-    parser.add_argument("--spark-timeout", type=float, default=8.0)
-    parser.add_argument("--spark-max-reply-chars", type=int, default=90)
+    parser.add_argument("--spark-max-tokens", type=int, default=320)
+    parser.add_argument("--spark-timeout", type=float, default=15.0)
+    parser.add_argument("--spark-max-reply-chars", type=int, default=160)
     parser.add_argument("--spark-min-chars", type=int, default=3)
+    parser.add_argument("--web-search", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--web-search-url", default=os.getenv("DOGZILLA_WEB_SEARCH_URL", "auto"))
+    parser.add_argument("--web-search-timeout", type=float, default=float(os.getenv("DOGZILLA_WEB_SEARCH_TIMEOUT", "8.0")))
+    parser.add_argument("--web-search-max-chars", type=int, default=int(os.getenv("DOGZILLA_WEB_SEARCH_MAX_CHARS", "1800")))
     parser.add_argument(
         "--spark-question-only",
         action=argparse.BooleanOptionalAction,
-        default=True,
-        help="只把明确问句或面向机器狗的请求发给 Spark",
+        default=False,
+        help="只把明确问句或面向机器狗的请求发给 AI 问答",
     )
     parser.add_argument(
         "--tts-backend",
@@ -1132,10 +1420,6 @@ def main() -> int:
     )
     board = StatusBoard()
     dashboard = None
-    if args.dashboard_port > 0:
-        dashboard = DashboardServer(board, port=args.dashboard_port)
-        dashboard.start()
-        print("电脑端仪表盘: http://{}:{}/".format(args.robot_ip, args.dashboard_port), flush=True)
 
     echo_guard = EchoGuard()
     expressions = ExpressionDisplay(enabled=not args.no_expressions)
@@ -1155,6 +1439,16 @@ def main() -> int:
         tts_timeout=args.tts_timeout,
     )
     controller = RuntimeController(speaker=speaker)
+
+    def dashboard_stop() -> None:
+        board.add_message("网页按钮: 停止所有任务", kind="event")
+        emergency_stop_everything(args, controller)
+
+    if args.dashboard_port > 0:
+        dashboard = DashboardServer(board, port=args.dashboard_port, on_stop=dashboard_stop)
+        dashboard.start()
+        print("电脑端仪表盘: http://{}:{}/".format(args.robot_ip, args.dashboard_port), flush=True)
+
     monitor = VoiceEventMonitor(args, controller, echo_guard=echo_guard, config=config)
 
     def run_task(task: HousekeeperTask) -> int:
@@ -1181,7 +1475,7 @@ def main() -> int:
         return run_grab_workflow(
             grab_command,
             cwd=housekeeper_dir,
-            speaker=speaker,
+            speaker=None if args.quiet_during_task else speaker,
             controller=controller,
         )
 
@@ -1193,6 +1487,7 @@ def main() -> int:
             lambda: wait_for_voice_task(args) if args.dry_voice else wait_for_controller_task(controller, args.voice_timeout),
             run_task,
             speaker=speaker,
+            quiet_during_task=args.quiet_during_task,
         )
     finally:
         monitor.stop()
