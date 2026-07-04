@@ -9,6 +9,7 @@ import time
 import threading
 import line_debug_stream
 import line_tracker
+import stop_marker
 from key import Button
 from picamera2 import Picamera2
 import sys
@@ -136,6 +137,12 @@ def TEST(args):
     global color_hsv,last_line_x
     frame_count = 0
     warned_missing_qr = False
+    line_started_at = time.time()
+    stop_block_detector = stop_marker.StopMarkerDetector(
+        required_frames=args.stop_block_required_frames,
+        min_area_ratio=args.stop_block_area_ratio,
+        min_width_ratio=args.stop_block_width_ratio,
+    )
     while True:
         frame_count += 1
         frame = picam2.capture_array()
@@ -167,6 +174,24 @@ def TEST(args):
         roi_frame = frame[LINE_ROI_Y_START:240, :]
         active_hsv = {line_color: color_hsv[line_color]}
         frame, binary,hsvname,xylist=update_hsv.get_contours(roi_frame,active_hsv)
+        if (
+            args.stop_on_black_block
+            and time.time() - line_started_at >= args.stop_block_ignore_seconds
+            and stop_block_detector.update(binary)
+        ):
+            status = "STOP_BLOCK_REACHED"
+            print(status, flush=True)
+            g_dog.stop()
+            cv2.putText(frame, status, (30,70), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255,255,255), 2)
+            update_debug_stream(frame, status)
+            station_navigation.write_line_result(
+                args.line_result,
+                success=True,
+                target_station=args.target_station or "stop_block",
+                reached_station="stop_block",
+                mode=args.line_mode,
+            )
+            return True
         decision = line_tracker_state.decide(binary, last_line_x)
 
         if line_color == 'blue':
@@ -244,11 +269,16 @@ def TEST(args):
             return False
 
 def build_parser():
-    parser = argparse.ArgumentParser(description="Follow colored guide line, optionally stopping at a QR station.")
+    parser = argparse.ArgumentParser(description="Follow colored guide line, optionally stopping at a stop block.")
     parser.add_argument("--target-station", default="")
     parser.add_argument("--line-result", type=Path, default=DEFAULT_LINE_RESULT)
     parser.add_argument("--line-mode", choices=("outbound", "return"), default="outbound")
     parser.add_argument("--qr-decode-every-frames", type=int, default=3)
+    parser.add_argument("--stop-on-black-block", action="store_true")
+    parser.add_argument("--stop-block-ignore-seconds", type=float, default=2.0)
+    parser.add_argument("--stop-block-required-frames", type=int, default=5)
+    parser.add_argument("--stop-block-area-ratio", type=float, default=stop_marker.DEFAULT_MIN_AREA_RATIO)
+    parser.add_argument("--stop-block-width-ratio", type=float, default=stop_marker.DEFAULT_MIN_WIDTH_RATIO)
     return parser
 
 
