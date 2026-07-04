@@ -425,6 +425,7 @@ def build_grab_workflow_command(
     turn_home_seconds: float = 2.4,
     line_result: Path | None = None,
     qr_decode_every_frames: int = 3,
+    delivery_task_mode: str = "qr",
     extra_args: list[str] | None = None,
 ) -> list[str]:
     command = [
@@ -437,6 +438,8 @@ def build_grab_workflow_command(
     if task is not None:
         command.extend(["--target-color", task.effective_color])
         command.extend(["--target-station", task.target_station])
+    if delivery_task_mode:
+        command.extend(["--task-mode", delivery_task_mode])
     if line_result is not None:
         command.extend(["--line-result", str(line_result)])
     if qr_decode_every_frames > 0:
@@ -616,6 +619,10 @@ class RuntimeController:
             if self._current_process is process:
                 self._current_process = None
 
+    def has_active_process(self) -> bool:
+        with self._lock:
+            return self._current_process is not None
+
     def request_stop(self) -> None:
         with self._lock:
             self._stop_generation += 1
@@ -731,6 +738,9 @@ class VoiceEventMonitor:
                 print("[VOICE] ignored self-echo: {}".format(text), flush=True)
                 continue
             if event is None:
+                if not should_answer_runtime_chat(self.controller):
+                    print("[VOICE] ignored chat while workflow is active: {}".format(text), flush=True)
+                    continue
                 answer_voice_chat(
                     text,
                     self.args,
@@ -752,12 +762,17 @@ class VoiceEventMonitor:
 VoiceControlMonitor = VoiceEventMonitor
 
 
+def should_answer_runtime_chat(controller: RuntimeController | None) -> bool:
+    return controller is None or not controller.has_active_process()
+
+
 def wait_for_owner_auth(
     command: list[str],
     *,
     timeout_seconds: float,
     cwd: Path | None = None,
     auth_result: Path = AUTH_RESULT_PATH,
+    controller: RuntimeController | None = None,
 ) -> bool:
     """结构化握手:人脸子进程确认主人后写结果文件并自己退出(exit 0)。
 
@@ -781,6 +796,8 @@ def wait_for_owner_auth(
         text=True,
         bufsize=1,
     )
+    if controller is not None:
+        controller.set_process(process)
     selector = selectors.DefaultSelector()
     assert process.stdout is not None
     selector.register(process.stdout, selectors.EVENT_READ)
@@ -804,6 +821,8 @@ def wait_for_owner_auth(
     finally:
         selector.close()
         terminate_process(process)
+        if controller is not None:
+            controller.clear_process(process)
 
 
 def wait_for_controller_task(controller: RuntimeController, timeout_seconds: float) -> HousekeeperTask | None:
@@ -813,6 +832,15 @@ def wait_for_controller_task(controller: RuntimeController, timeout_seconds: flo
     else:
         print("Task confirmed from voice: {}".format(task.summary()), flush=True)
     return task
+
+
+def wait_after_global_stop(controller: RuntimeController | None) -> bool:
+    if controller is None:
+        return False
+    if not controller.mark_stop_handled():
+        return False
+    controller.wait_while_paused()
+    return True
 
 
 def wait_for_voice_task(args: argparse.Namespace) -> HousekeeperTask | None:
@@ -878,6 +906,9 @@ def wait_for_task_loop(
 
 
 def workflow_feedback_for_line(line: str) -> str | None:
+    if line.startswith("TASK_QR_SCAN_START"):
+        prompt = line.removeprefix("TASK_QR_SCAN_START").strip()
+        return prompt or "请把任务二维码放到摄像头前"
     if "=== GRAB ===" in line:
         return "开始抓球"
     if "Grab succeeded" in line:
@@ -970,32 +1001,55 @@ def run_sequence(
     listen_for_task: Callable[[], HousekeeperTask | None],
     run_task: Callable[[HousekeeperTask], int],
     speaker: object | None = None,
+    controller: RuntimeController | None = None,
 ) -> int:
-    set_stage(speaker, "FACE_AUTH")
-    show_expression(speaker, "scan")
-    speak(speaker, "开始识别人脸")
-    if not authenticate_owner():
+    while True:
+        if controller is not None:
+            controller.wait_while_paused()
+        set_stage(speaker, "FACE_AUTH")
+        show_expression(speaker, "scan")
+        speak(speaker, "开始识别人脸")
+        if authenticate_owner():
+            break
+        if wait_after_global_stop(controller):
+            continue
         show_expression(speaker, "fail")
         speak(speaker, "人脸识别失败")
         return EXIT_AUTH_FAILED
+
     show_expression(speaker, "happy")
     speak(speaker, "人脸识别成功")
-    set_stage(speaker, "LISTEN")
-    show_expression(speaker, "listen")
-    speak(speaker, "开始听语音指令")
-    task = listen_for_task()
-    if task is None:
+
+    while True:
+        if controller is not None:
+            controller.wait_while_paused()
+        set_stage(speaker, "LISTEN")
+        show_expression(speaker, "listen")
+        speak(speaker, "开始听语音指令")
+        task = listen_for_task()
+        if task is not None:
+            break
+        if wait_after_global_stop(controller):
+            continue
         show_expression(speaker, "fail")
         speak(speaker, "没有收到任务")
         return EXIT_NO_TASK
-    set_stage(speaker, "TASK")
-    show_expression(speaker, "work")
-    notice = task.capability_notice()
-    if notice:
-        speak(speaker, notice)
-    speak(speaker, task.spoken_summary())
-    speak(speaker, "开始执行捡球任务")
-    code = run_task(task)
+
+    while True:
+        if controller is not None:
+            controller.wait_while_paused()
+        set_stage(speaker, "TASK")
+        show_expression(speaker, "work")
+        notice = task.capability_notice()
+        if notice:
+            speak(speaker, notice)
+        speak(speaker, task.spoken_summary())
+        speak(speaker, "开始执行捡球任务")
+        code = run_task(task)
+        if code != 0 and wait_after_global_stop(controller):
+            continue
+        break
+
     set_stage(speaker, "DONE")
     if code == 0:
         show_expression(speaker, "success")
@@ -1018,6 +1072,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--voice-retry-delay", type=float, default=1.0)
     parser.add_argument("--dry-voice", action="store_true", help="从终端输入模拟语音文本")
     parser.add_argument("--line-seconds", type=float, default=0.0)
+    parser.add_argument("--delivery-task-mode", default="qr", help="传给 grab_then_follow_line.py 的任务模式")
     parser.add_argument("--disable-return-home", action="store_true", help="到站后不执行返航")
     parser.add_argument("--target-station", default="", help="调试用:覆盖语音解析出的目标站点")
     parser.add_argument("--target-color", default="", help="调试用:覆盖实际执行颜色")
@@ -1176,6 +1231,7 @@ def main() -> int:
             turn_home_seconds=config.return_home.turn_seconds,
             line_result=Path(config.line.result_path),
             qr_decode_every_frames=config.line.qr_decode_every_frames,
+            delivery_task_mode=args.delivery_task_mode,
             extra_args=args.grab_workflow_arg,
         )
         return run_grab_workflow(
@@ -1189,10 +1245,16 @@ def main() -> int:
         monitor.start()
     try:
         return run_sequence(
-            lambda: wait_for_owner_auth(face_command, timeout_seconds=args.face_timeout, cwd=housekeeper_dir),
+            lambda: wait_for_owner_auth(
+                face_command,
+                timeout_seconds=args.face_timeout,
+                cwd=housekeeper_dir,
+                controller=controller,
+            ),
             lambda: wait_for_voice_task(args) if args.dry_voice else wait_for_controller_task(controller, args.voice_timeout),
             run_task,
             speaker=speaker,
+            controller=controller,
         )
     finally:
         monitor.stop()

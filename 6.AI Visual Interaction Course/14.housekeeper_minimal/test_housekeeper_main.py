@@ -102,11 +102,11 @@ class HousekeeperMainTest(unittest.TestCase):
                 self.assertIsNone(housekeeper_main.parse_task_trigger(text))
 
     def test_control_command_parses_stop_and_continue(self):
-        for text in ("停止", "停下", "急停", "暂停"):
+        for text in ("停止", "停下", "急停", "暂停", "停止任务", "暂停任务"):
             with self.subTest(text=text):
                 self.assertEqual(housekeeper_main.parse_control_command(text), "stop")
 
-        for text in ("继续", "恢复任务", "接着执行"):
+        for text in ("继续", "恢复任务", "接着执行", "继续任务", "恢复执行"):
             with self.subTest(text=text):
                 self.assertEqual(housekeeper_main.parse_control_command(text), "continue")
 
@@ -335,12 +335,23 @@ class HousekeeperMainTest(unittest.TestCase):
         self.assertEqual(received, task)
         self.assertIsNone(controller.wait_for_task(timeout_seconds=0.01))
 
+    def test_runtime_controller_suppresses_chat_while_child_process_is_active(self):
+        controller = housekeeper_main.RuntimeController()
+        process = object()
+
+        self.assertTrue(housekeeper_main.should_answer_runtime_chat(controller))
+        controller.set_process(process)
+        self.assertFalse(housekeeper_main.should_answer_runtime_chat(controller))
+        controller.clear_process(process)
+        self.assertTrue(housekeeper_main.should_answer_runtime_chat(controller))
+
     def test_workflow_feedback_from_child_logs(self):
         cases = {
             "=== GRAB ===": "开始抓球",
             "Grab succeeded. Releasing camera before line following.": "捡球成功",
             "=== FIND_AND_ALIGN_LINE ===": "开始寻找黑线",
             "Line alignment succeeded. Starting line following.": "开始巡线",
+            "TASK_QR_SCAN_START 请把任务二维码放到摄像头前": "请把任务二维码放到摄像头前",
         }
 
         for line, expected in cases.items():
@@ -379,6 +390,7 @@ class HousekeeperMainTest(unittest.TestCase):
                 color_label="绿球",
             ),
             return_home=True,
+            delivery_task_mode="qr",
             extra_args=["--stream-grab"],
         )
 
@@ -389,6 +401,8 @@ class HousekeeperMainTest(unittest.TestCase):
         self.assertIn("station_B", command)
         self.assertIn("--target-color", command)
         self.assertIn("green", command)
+        self.assertIn("--task-mode", command)
+        self.assertIn("qr", command)
         self.assertIn("--return-home", command)
         self.assertEqual(command[-1], "--stream-grab")
 
@@ -437,6 +451,44 @@ class HousekeeperMainTest(unittest.TestCase):
 
         self.assertEqual(code, housekeeper_main.EXIT_AUTH_FAILED)
         self.assertEqual(calls, ["auth"])
+
+    def test_run_sequence_retries_stage_after_global_pause_and_continue(self):
+        calls = []
+        speaker = self.FakeSpeaker()
+        controller = housekeeper_main.RuntimeController(speaker=speaker)
+        original_stop_robot_motion = housekeeper_main.stop_robot_motion
+        housekeeper_main.stop_robot_motion = lambda **_kwargs: None
+
+        def auth():
+            calls.append("auth")
+            if calls.count("auth") == 1:
+                controller.request_stop()
+                controller.request_continue()
+                return False
+            return True
+
+        def listen():
+            calls.append("listen")
+            return housekeeper_main.HousekeeperTask("grab_then_follow_line", "开始任务")
+
+        def run_task(_task):
+            calls.append("task")
+            return 0
+
+        try:
+            code = housekeeper_main.run_sequence(
+                auth,
+                listen,
+                run_task,
+                speaker=speaker,
+                controller=controller,
+            )
+        finally:
+            housekeeper_main.stop_robot_motion = original_stop_robot_motion
+
+        self.assertEqual(code, 0)
+        self.assertEqual(calls, ["auth", "auth", "listen", "task"])
+        self.assertNotIn("人脸识别失败", speaker.messages)
 
     def test_wait_for_task_loop_retries_after_voice_error(self):
         calls = []
