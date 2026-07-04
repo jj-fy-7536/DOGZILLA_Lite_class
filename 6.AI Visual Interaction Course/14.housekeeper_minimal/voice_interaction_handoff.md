@@ -14,7 +14,7 @@
 这个模块让 DOGZILLA Lite 通过麦克风持续监听语音，并执行以下能力：
 
 - 动作控制：坐下、握手、站起来、停止、前进、后退、左转、右转
-- 天气查询：必须带城市，例如“绍兴天气怎么样”“今天绍兴冷不冷”
+- 天气查询：不再作为单独内置指令，直接作为普通问句进入 DeepSeek/API；总控里会带网页搜索上下文。
 - 音乐播放：识别“放歌”“播放音乐”“听歌”后播放 `/home/pi/dogzilla_runs/music/` 里的歌曲；“停歌”“停止播放”停止音乐
 - 简单智能问答：例如“中国首都是哪里”“你是谁”
 - 请求类语句：例如“背一下静夜思”“讲个故事”“介绍一下李白”
@@ -31,7 +31,7 @@
 - 麦克风录音命令：`arecord`
 - 播放命令：`mplayer`
 - Python 包：`websocket-client`
-- 能访问互联网，用于讯飞语音识别、星火大模型、天气查询
+- 能访问互联网，用于讯飞语音识别、DeepSeek 问答、网页搜索和天气查询
 
 ## 密钥配置
 
@@ -52,6 +52,12 @@ export XFYUN_TTS_APPID="你的在线语音合成APPID"
 export XFYUN_TTS_API_KEY="你的在线语音合成APIKey"
 export XFYUN_TTS_API_SECRET="你的在线语音合成APISecret"
 export XFYUN_TTS_VCN="x4_xiaoyan"
+export DEEPSEEK_API_KEY="YOUR_DEEPSEEK_API_KEY"
+export DEEPSEEK_MODEL="deepseek-v4-flash"
+# 可选；默认就是这个地址
+export DEEPSEEK_API_URL="https://api.deepseek.com/chat/completions"
+
+# 旧 Spark 配置仍可作为回退；没有 DEEPSEEK_API_KEY 时才会使用
 export SPARK_API_PASSWORD="你的Spark Lite APIPassword"
 export SPARK_MODEL="lite"
 ```
@@ -154,13 +160,15 @@ PY
 - “听歌”
 - “停歌”
 
-天气：
+天气和实时问答：
 
 - “绍兴天气怎么样”
 - “杭州今天热不热”
 - “北京会不会下雨”
+- “最近的国际形势怎么样”
+- “今天世界杯比赛怎么样”
 
-注意：问天气必须说城市。只说“今天天气怎么样”时，机器狗会问你想查哪个城市。
+注意：天气不再走本地天气 API，也不会要求必须带城市；如果信息不足，DeepSeek 会根据搜索结果回答或简短追问。
 
 智能问答和请求：
 
@@ -176,9 +184,9 @@ PY
 - 语音识别使用讯飞 IAT WebSocket，默认实时流模式。
 - 语音播报优先使用讯飞在线语音合成 WebAPI，默认发音人 `x4_xiaoyan`；失败时回退到官方 `SpeechSynthesis()`。
 - 音乐播放调用 `/home/pi/dogzilla_runs/dogzilla_music_player.py --background`，默认播放 `/home/pi/dogzilla_runs/music/` 的第一首歌。
-- 大模型使用 Spark Lite HTTP 接口。
+- 大模型问答优先使用 DeepSeek Chat Completions 接口；没有 `DEEPSEEK_API_KEY` 时仍兼容旧 Spark Lite HTTP 接口。
 - 明确动作指令优先，不会被大模型抢走。
-- 普通陈述句默认忽略，只有问句或明显对机器狗发出的请求才会进入大模型。
+- 普通陈述句和明显噪音/碎片词默认忽略，只有问句、实时搜索类问题或明显对机器狗发出的请求才会进入大模型。
 - 机器狗播报后会短时间过滤回声，避免它听到自己的声音后重复回答。
 - 在线语音合成会生成 16k 单声道 WAV 并用 `aplay`/`mplayer` 播放；回退到 `SpeechSynthesis()` 时仍不会额外播放第二遍。
 
@@ -189,20 +197,20 @@ PY
 - 检查机器狗是否联网。
 - 检查 `voice_interaction.py` 是否在运行。
 - 查看 `/home/pi/dogzilla_runs/voice_interaction.log`。
-- 检查 `voice_env.sh` 是否配置了讯飞和 Spark 密钥。
+- 检查 `voice_env.sh` 是否配置了讯飞和 DeepSeek 密钥。
 
 动作不执行：
 
 - 确认不是只启动在电脑上，程序必须在机器狗上运行。
 - 确认 `PYTHONPATH` 包含 `/home/pi/RaspberryPi-CM5/app:/home/pi/RaspberryPi-CM5/demos:.`。
 
-天气城市不对：
+天气或实时信息不准：
 
-- 说完整城市名，例如“绍兴天气怎么样”，不要只说“今天天气怎么样”。
-- 如果城市名识别错，先看日志里的 `[ASR]` 内容。
+- 先看日志里的 `[ASR]` 内容，确认识别文本是否正确。
+- 问实时信息时尽量说清对象，例如“杭州天气怎么样”“最近的国际形势怎么样”“今天世界杯比赛怎么样”。
 
 大模型不回答：
 
 - 普通陈述句会被故意忽略。
 - 尝试说成请求句或问句，例如“背一下静夜思”“这个问题怎么解决”。
-- 检查 `SPARK_API_PASSWORD` 是否可用。
+- 检查 `DEEPSEEK_API_KEY` 是否可用；如果走旧 Spark 回退，再检查 `SPARK_API_PASSWORD`。

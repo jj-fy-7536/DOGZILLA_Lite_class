@@ -67,9 +67,17 @@ class EchoGuard:
         return False
 
     def _matches(self, candidate: str, spoken: str) -> bool:
-        if len(candidate) >= 2 and (candidate in spoken or spoken in candidate):
+        if candidate == spoken:
             return True
-        return SequenceMatcher(None, candidate, spoken).ratio() >= self.similarity_threshold
+        risky_short_echoes = {"捡球", "拣球", "抓球", "拿球", "找球", "送球"}
+        if candidate in spoken and (len(candidate) >= 4 or candidate in risky_short_echoes):
+            return True
+        if spoken in candidate and len(spoken) >= 4:
+            return True
+        threshold = self.similarity_threshold
+        if max(len(candidate), len(spoken)) >= 8:
+            threshold = max(threshold, 0.82)
+        return SequenceMatcher(None, candidate, spoken).ratio() >= threshold
 
     def _prune_locked(self) -> None:
         now = self._clock()

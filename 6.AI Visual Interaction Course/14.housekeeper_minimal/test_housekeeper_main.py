@@ -1,11 +1,14 @@
 import importlib.util
 import json
 import argparse
+import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 from pathlib import Path
+from unittest import mock
 
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -317,6 +320,27 @@ class HousekeeperMainTest(unittest.TestCase):
         self.assertTrue(handled)
         self.assertEqual(speaker.messages, ["这个问题我暂时回答失败了"])
 
+    def test_deepseek_cli_aliases_feed_chat_settings(self):
+        args = housekeeper_main.build_parser().parse_args(
+            [
+                "--deepseek-api-key",
+                "deepseek-key",
+                "--deepseek-api-url",
+                "https://example.test/chat/completions",
+                "--deepseek-model",
+                "deepseek-v4-pro",
+            ]
+        )
+
+        self.assertEqual(args.spark_api_password, "deepseek-key")
+        self.assertEqual(args.spark_api_url, "https://example.test/chat/completions")
+        self.assertEqual(args.spark_model, "deepseek-v4-pro")
+
+    def test_chat_filter_is_open_by_default_in_housekeeper_main(self):
+        args = housekeeper_main.build_parser().parse_args([])
+
+        self.assertFalse(args.spark_question_only)
+
     def test_tts_speaker_prefers_online_human_voice_backend(self):
         online_tts = self.FakeOnlineTts()
         speaker = housekeeper_main.TtsSpeaker(online_tts=online_tts)
@@ -335,6 +359,47 @@ class HousekeeperMainTest(unittest.TestCase):
         self.assertEqual(received, task)
         self.assertIsNone(controller.wait_for_task(timeout_seconds=0.01))
 
+    def test_runtime_stop_does_not_pause_future_work(self):
+        controller = housekeeper_main.RuntimeController()
+
+        with mock.patch.object(housekeeper_main, "stop_robot_motion"):
+            controller.request_stop(speak_feedback=False)
+
+        unblocked = threading.Event()
+        waiter = threading.Thread(
+            target=lambda: (controller.wait_while_paused(), unblocked.set()),
+            daemon=True,
+        )
+        waiter.start()
+
+        self.assertTrue(unblocked.wait(0.2))
+
+    def test_grab_workflow_stops_without_waiting_for_continue_or_resuming(self):
+        controller = housekeeper_main.RuntimeController()
+        calls = []
+
+        def fake_run(command, **kwargs):
+            calls.append(command)
+            with mock.patch.object(housekeeper_main, "stop_robot_motion"):
+                controller.request_stop(speak_feedback=False)
+            return 130
+
+        result = {}
+
+        def run_workflow():
+            result["code"] = housekeeper_main.run_grab_workflow(
+                ["/python", "grab.py"],
+                controller=controller,
+            )
+
+        with mock.patch.object(housekeeper_main, "_run_grab_workflow_once", side_effect=fake_run):
+            worker = threading.Thread(target=run_workflow, daemon=True)
+            worker.start()
+            self.assertTrue(worker.join(timeout=0.4) is None and not worker.is_alive())
+
+        self.assertEqual(result["code"], housekeeper_main.EXIT_STOPPED)
+        self.assertEqual(calls, [["/python", "grab.py"]])
+
     def test_workflow_feedback_from_child_logs(self):
         cases = {
             "=== GRAB ===": "开始抓球",
@@ -346,6 +411,43 @@ class HousekeeperMainTest(unittest.TestCase):
         for line, expected in cases.items():
             with self.subTest(line=line):
                 self.assertEqual(housekeeper_main.workflow_feedback_for_line(line), expected)
+
+    def test_grab_workflow_child_starts_new_process_group(self):
+        class FakeProcess:
+            stdout = []
+
+            def wait(self):
+                return 0
+
+        with mock.patch.object(housekeeper_main.subprocess, "Popen", return_value=FakeProcess()) as popen:
+            code = housekeeper_main._run_grab_workflow_once(["/python", "grab.py"])
+
+        self.assertEqual(code, 0)
+        self.assertTrue(popen.call_args.kwargs["start_new_session"])
+
+    def test_terminate_process_sends_signal_to_process_group(self):
+        class FakeProcess:
+            pid = 12345
+
+            def __init__(self):
+                self.signals = []
+
+            def poll(self):
+                return None
+
+            def send_signal(self, sig):
+                self.signals.append(sig)
+
+            def wait(self, timeout=None):
+                return 0
+
+        process = FakeProcess()
+
+        with mock.patch.object(housekeeper_main.os, "killpg") as killpg:
+            self.assertTrue(housekeeper_main.terminate_process(process))
+
+        killpg.assert_called_once_with(process.pid, signal.SIGINT)
+        self.assertEqual(process.signals, [])
 
     def test_build_face_auth_command_runs_face_module_unbuffered(self):
         command = housekeeper_main.build_face_auth_command(
@@ -417,6 +519,39 @@ class HousekeeperMainTest(unittest.TestCase):
             speaker.messages,
             ["开始识别人脸", "人脸识别成功", "开始听语音指令", "收到,去拿红球送到客厅", "开始执行捡球任务", "任务完成"],
         )
+
+    def test_run_sequence_returns_to_listen_after_task_is_stopped(self):
+        calls = []
+        tasks = [
+            housekeeper_main.HousekeeperTask("grab_then_follow_line", "开始任务"),
+            None,
+        ]
+
+        def auth():
+            calls.append("auth")
+            return True
+
+        def listen():
+            calls.append("listen")
+            return tasks.pop(0)
+
+        def run_task(_task):
+            calls.append("task")
+            return housekeeper_main.EXIT_STOPPED
+
+        speaker = self.FakeSpeaker()
+
+        code = housekeeper_main.run_sequence(
+            auth,
+            listen,
+            run_task,
+            speaker=speaker,
+            quiet_during_task=True,
+        )
+
+        self.assertEqual(code, housekeeper_main.EXIT_NO_TASK)
+        self.assertEqual(calls, ["auth", "listen", "task", "listen"])
+        self.assertNotIn("任务失败", speaker.messages)
 
     def test_run_sequence_stops_when_owner_not_confirmed(self):
         calls = []
