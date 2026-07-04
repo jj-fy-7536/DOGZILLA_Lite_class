@@ -22,6 +22,7 @@ import hmac
 import json
 import os
 import re
+import signal
 import shutil
 import ssl
 import subprocess
@@ -78,6 +79,47 @@ SPARK_SYSTEM_PROMPT = os.getenv(
     "一般不超过80个汉字。不要承诺播放音乐、闹钟、拍照、导航等未接入功能；"
     "除普通问答、背诗、讲故事、介绍知识外，目前可执行指令只有：坐下、握手、站起来、停止、前进、后退、左转、右转；"
     "问天气时需要用户说出城市。",
+)
+QWEN_API_KEY = (
+    os.getenv("QWEN_API_KEY")
+    or os.getenv("DASHSCOPE_API_KEY")
+    or os.getenv("BAILIAN_API_KEY")
+    or ""
+)
+QWEN_API_BASE = (
+    os.getenv("QWEN_API_BASE")
+    or os.getenv("DASHSCOPE_API_BASE")
+    or os.getenv("BAILIAN_API_BASE")
+    or "https://dashscope.aliyuncs.com/compatible-mode/v1"
+).rstrip("/")
+QWEN_MODEL = os.getenv("QWEN_MODEL", "qwen-plus")
+QWEN_WEB_SEARCH = os.getenv("QWEN_WEB_SEARCH", "1").strip().lower() not in (
+    "0",
+    "false",
+    "no",
+    "off",
+)
+QWEN_SYSTEM_PROMPT = os.getenv(
+    "QWEN_SYSTEM_PROMPT",
+    "你是DOGZILLA Lite机器狗的语音助手。你运行在一只真实机器狗上。"
+    "请用中文口语化回答，简短自然，适合直接朗读；一般不超过90个汉字。"
+    "用户问实时信息、新闻、天气、比赛、价格、日期等内容时，要优先使用联网搜索结果。"
+    "不要编造你不能控制的功能。机器狗本地已经能执行停止、坐下、握手、站起来、前进、后退、左转、右转等动作，"
+    "这些动作由本地程序执行，你只负责其它问答、背诗、讲故事和知识解释。",
+)
+LOCAL_WEATHER_ENABLED = os.getenv("DOGZILLA_LOCAL_WEATHER", "1").strip().lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
+DEFAULT_STOP_KILL_DIRS = os.getenv(
+    "DOGZILLA_STOP_KILL_DIRS",
+    "/home/pi/dogzilla_runs,/home/pi/DOGZILLA_Lite_class",
+)
+DEFAULT_STOP_KILL_PATTERNS = os.getenv(
+    "DOGZILLA_STOP_KILL_PATTERNS",
+    "line_follow,follow_line,grab_then_follow_line,housekeeper_main,red_ball_grab,ball_grab,pick_up,pick_it_up",
 )
 
 STATUS_FIRST_FRAME = 0
@@ -688,6 +730,106 @@ def has_any(text: str, keywords: tuple[str, ...]) -> bool:
     return any(keyword in text for keyword in keywords)
 
 
+def stop_other_robot_tasks(args: argparse.Namespace) -> None:
+    if not args.stop_kill_tasks:
+        return
+    if not os.path.isdir("/proc"):
+        print("[STOP] process cleanup skipped: /proc not available", flush=True)
+        return
+
+    victims = find_other_robot_task_pids(args)
+    if not victims:
+        print("[STOP] no other robot task process", flush=True)
+        return
+
+    for pid, description in victims:
+        try:
+            os.kill(pid, signal.SIGTERM)
+            print("[STOP] terminate task pid={} cmd={}".format(pid, description), flush=True)
+        except ProcessLookupError:
+            pass
+        except Exception as exc:
+            print("[STOP] terminate failed pid={}: {!r}".format(pid, exc), flush=True)
+
+    time.sleep(max(0.0, args.stop_kill_wait))
+
+    for pid, description in victims:
+        if not process_alive(pid):
+            continue
+        try:
+            os.kill(pid, signal.SIGKILL)
+            print("[STOP] force kill task pid={} cmd={}".format(pid, description), flush=True)
+        except ProcessLookupError:
+            pass
+        except Exception as exc:
+            print("[STOP] force kill failed pid={}: {!r}".format(pid, exc), flush=True)
+
+
+def find_other_robot_task_pids(args: argparse.Namespace) -> list[tuple[int, str]]:
+    current_pid = os.getpid()
+    current_ppid = os.getppid()
+    kill_dirs = split_csv(args.stop_kill_dirs)
+    kill_patterns = tuple(pattern.lower() for pattern in split_csv(args.stop_kill_patterns))
+    victims: list[tuple[int, str]] = []
+
+    for proc_name in os.listdir("/proc"):
+        if not proc_name.isdigit():
+            continue
+        pid = int(proc_name)
+        if pid in (current_pid, current_ppid):
+            continue
+
+        parts = read_process_cmdline(pid)
+        if not parts:
+            continue
+        if is_voice_process(parts):
+            continue
+        if should_kill_robot_task(parts, kill_dirs, kill_patterns):
+            victims.append((pid, " ".join(parts)[:180]))
+
+    return victims
+
+
+def read_process_cmdline(pid: int) -> list[str]:
+    try:
+        with open("/proc/{}/cmdline".format(pid), "rb") as fp:
+            raw = fp.read()
+    except OSError:
+        return []
+    return [part.decode("utf-8", "ignore") for part in raw.split(b"\0") if part]
+
+
+def is_voice_process(parts: list[str]) -> bool:
+    return any(os.path.basename(part) == "voice_interaction.py" for part in parts)
+
+
+def should_kill_robot_task(parts: list[str], kill_dirs: tuple[str, ...], kill_patterns: tuple[str, ...]) -> bool:
+    joined = " ".join(parts).lower()
+    script_paths = [part for part in parts if part.endswith(".py")]
+
+    for script_path in script_paths:
+        normalized = os.path.abspath(script_path)
+        for kill_dir in kill_dirs:
+            if normalized.startswith(os.path.abspath(kill_dir) + os.sep):
+                return True
+
+    return any(pattern and pattern in joined for pattern in kill_patterns)
+
+
+def process_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+
+
+def split_csv(text: str) -> tuple[str, ...]:
+    return tuple(item.strip() for item in str(text).split(",") if item.strip())
+
+
 MUSIC_PLAY_KEYWORDS = (
     "放歌",
     "播放音乐",
@@ -875,15 +1017,50 @@ WAKE_WORDS = (
 )
 
 
-def should_use_spark_chat(text: str, args: argparse.Namespace) -> bool:
-    cleaned = clean_text(text)
-    if not args.spark_chat or not args.spark_api_password:
+def chat_backend_available(args: argparse.Namespace) -> bool:
+    qwen = bool(getattr(args, "qwen_api_key", "") and getattr(args, "qwen_chat", True))
+    spark = bool(getattr(args, "spark_api_password", "") and getattr(args, "spark_chat", True))
+    return qwen or spark
+
+
+def effective_question_only(args: argparse.Namespace) -> bool:
+    if getattr(args, "qwen_api_key", "") and getattr(args, "qwen_chat", True):
+        return getattr(args, "qwen_question_only", False)
+    return getattr(args, "spark_question_only", True)
+
+
+def effective_chat_min_chars(args: argparse.Namespace) -> int:
+    if getattr(args, "qwen_api_key", "") and getattr(args, "qwen_chat", True):
+        return getattr(args, "qwen_min_chars", 2)
+    return getattr(args, "spark_min_chars", 3)
+
+
+def should_use_qwen_chat(text: str, args: argparse.Namespace) -> bool:
+    if not getattr(args, "qwen_chat", True) or not getattr(args, "qwen_api_key", ""):
         return False
-    if len(cleaned) < args.spark_min_chars:
+    cleaned = clean_text(text)
+    if len(cleaned) < getattr(args, "qwen_min_chars", 2):
         return False
     if cleaned in CHAT_IGNORED_TEXTS:
         return False
-    if args.spark_question_only and not (is_question_text(text) or is_directed_request_text(text)):
+    if getattr(args, "qwen_question_only", False) and not (
+        is_question_text(text) or is_directed_request_text(text)
+    ):
+        return False
+    return True
+
+
+def should_use_spark_chat(text: str, args: argparse.Namespace) -> bool:
+    if not getattr(args, "spark_chat", True):
+        return False
+    if not chat_backend_available(args):
+        return False
+    cleaned = clean_text(text)
+    if len(cleaned) < effective_chat_min_chars(args):
+        return False
+    if cleaned in CHAT_IGNORED_TEXTS:
+        return False
+    if effective_question_only(args) and not (is_question_text(text) or is_directed_request_text(text)):
         return False
     return True
 
@@ -932,17 +1109,198 @@ def is_recent_duplicate_text(text: str, last_text: str, last_at: float, args: ar
     return SequenceMatcher(None, cleaned, last_text).ratio() >= args.same_text_similarity
 
 
-def fetch_spark_answer(question: str, args: argparse.Namespace) -> str:
+REALTIME_SEARCH_KEYWORDS = (
+    "今天",
+    "今日",
+    "现在",
+    "目前",
+    "实时",
+    "最新",
+    "刚刚",
+    "刚才",
+    "新闻",
+    "天气",
+    "气温",
+    "温度",
+    "下雨",
+    "世界杯",
+    "比赛",
+    "赛程",
+    "比分",
+    "冠军",
+    "开赛",
+    "价格",
+    "股价",
+    "汇率",
+    "几点",
+    "日期",
+)
+
+
+def normalize_qwen_api_base(api_base: str) -> str:
+    base = (api_base or "").strip().rstrip("/")
+    for suffix in ("/chat/completions", "/responses"):
+        if base.endswith(suffix):
+            base = base[: -len(suffix)].rstrip("/")
+    if not base:
+        raise RuntimeError("Missing QWEN_API_BASE")
+    return base
+
+
+def post_json(url: str, payload: dict, api_key: str, timeout: float) -> dict:
+    body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    request = Request(
+        url,
+        data=body,
+        method="POST",
+        headers={
+            "Authorization": "Bearer {}".format(api_key),
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+        },
+    )
+    with urlopen(request, timeout=timeout) as response:
+        return json.loads(response.read().decode("utf-8"))
+
+
+def extract_qwen_answer(response_payload: dict) -> str:
+    output_text = response_payload.get("output_text")
+    if isinstance(output_text, str) and output_text.strip():
+        return output_text.strip()
+
+    output = response_payload.get("output")
+    if isinstance(output, list):
+        pieces: list[str] = []
+        for item in output:
+            if not isinstance(item, dict):
+                continue
+            content = item.get("content")
+            if isinstance(content, str) and content.strip():
+                pieces.append(content.strip())
+            elif isinstance(content, list):
+                for part in content:
+                    if isinstance(part, str) and part.strip():
+                        pieces.append(part.strip())
+                    elif isinstance(part, dict):
+                        text = part.get("text") or part.get("content") or part.get("output_text")
+                        if isinstance(text, str) and text.strip():
+                            pieces.append(text.strip())
+            text = item.get("text") or item.get("output_text")
+            if isinstance(text, str) and text.strip():
+                pieces.append(text.strip())
+        if pieces:
+            return "\n".join(pieces)
+
+    choices = response_payload.get("choices") or []
+    if choices:
+        message = choices[0].get("message") or {}
+        content = message.get("content")
+        if isinstance(content, str) and content.strip():
+            return content.strip()
+        if isinstance(content, list):
+            pieces = []
+            for part in content:
+                if isinstance(part, dict):
+                    text = part.get("text") or part.get("content")
+                    if isinstance(text, str) and text.strip():
+                        pieces.append(text.strip())
+                elif isinstance(part, str) and part.strip():
+                    pieces.append(part.strip())
+            if pieces:
+                return "\n".join(pieces)
+        text = choices[0].get("text")
+        if isinstance(text, str) and text.strip():
+            return text.strip()
+
+    raise RuntimeError("Qwen returned no answer text")
+
+
+def should_use_qwen_web_search(question: str, args: argparse.Namespace) -> bool:
+    if not args.qwen_web_search:
+        return False
+    if args.qwen_always_search:
+        return True
+    return has_any(clean_text(question), REALTIME_SEARCH_KEYWORDS)
+
+
+def fetch_qwen_answer(question: str, args: argparse.Namespace) -> str:
+    if not args.qwen_api_key:
+        raise RuntimeError("Missing QWEN_API_KEY")
+
+    now_text = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
+    api_base = normalize_qwen_api_base(args.qwen_api_base)
+    system_prompt = (
+        "{}\n"
+        "当前时间：{}。\n"
+        "请只输出适合机器狗直接朗读的一段回答，不要解释这些规则。"
+    ).format(args.qwen_system_prompt, now_text)
+
+    chat_payload = {
+        "model": args.qwen_model,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": question},
+        ],
+        "stream": False,
+        "temperature": args.qwen_temperature,
+        "max_tokens": args.qwen_max_tokens,
+    }
+    use_search = should_use_qwen_web_search(question, args)
+    timeout = args.qwen_search_timeout if use_search else args.qwen_timeout
+    if use_search:
+        chat_payload["enable_search"] = True
+
+    try:
+        response_payload = post_json(
+            "{}/chat/completions".format(api_base),
+            chat_payload,
+            args.qwen_api_key,
+            timeout,
+        )
+    except Exception as exc:
+        if not use_search:
+            raise
+        print("[QWEN] web search failed, fallback to no-search chat: {!r}".format(exc), flush=True)
+        chat_payload.pop("enable_search", None)
+        response_payload = post_json(
+            "{}/chat/completions".format(api_base),
+            chat_payload,
+            args.qwen_api_key,
+            args.qwen_timeout,
+        )
+
+    if response_payload.get("code") not in (None, 0):
+        if not use_search:
+            raise RuntimeError(response_payload.get("message", response_payload))
+        print(
+            "[QWEN] web search returned error, fallback to no-search chat:",
+            response_payload.get("message", response_payload),
+            flush=True,
+        )
+        chat_payload.pop("enable_search", None)
+        response_payload = post_json(
+            "{}/chat/completions".format(api_base),
+            chat_payload,
+            args.qwen_api_key,
+            args.qwen_timeout,
+        )
+        if response_payload.get("code") not in (None, 0):
+            raise RuntimeError(response_payload.get("message", response_payload))
+    answer = extract_qwen_answer(response_payload)
+    return compact_tts_text(answer, max_chars=args.qwen_max_reply_chars)
+
+
+def fetch_spark_lite_answer(question: str, args: argparse.Namespace) -> str:
     if not args.spark_api_password:
         raise RuntimeError("Missing SPARK_API_PASSWORD")
 
     now_text = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
     speech_prompt = (
-        f"{args.spark_system_prompt}\n"
-        f"当前时间：{now_text}。\n"
-        f"用户问题：{question}\n"
+        "{}\n"
+        "当前时间：{}。\n"
+        "用户问题：{}\n"
         "请只输出适合机器狗直接朗读的一段回答，不要解释这些规则。"
-    )
+    ).format(args.spark_system_prompt, now_text, question)
     payload = {
         "model": args.spark_model,
         "messages": [{"role": "user", "content": speech_prompt}],
@@ -956,7 +1314,7 @@ def fetch_spark_answer(question: str, args: argparse.Namespace) -> str:
         data=body,
         method="POST",
         headers={
-            "Authorization": f"Bearer {args.spark_api_password}",
+            "Authorization": "Bearer {}".format(args.spark_api_password),
             "Content-Type": "application/json",
             "Accept": "application/json",
         },
@@ -977,6 +1335,19 @@ def fetch_spark_answer(question: str, args: argparse.Namespace) -> str:
     if not answer:
         answer = choices[0].get("text", "")
     return compact_tts_text(answer, max_chars=args.spark_max_reply_chars)
+
+
+def fetch_spark_answer(question: str, args: argparse.Namespace) -> str:
+    if getattr(args, "qwen_api_key", "") and getattr(args, "qwen_chat", True):
+        try:
+            return fetch_qwen_answer(question, args)
+        except Exception as exc:
+            print("[QWEN] error: {!r}".format(exc), flush=True)
+            if getattr(args, "spark_api_password", ""):
+                print("[QWEN] fallback to Spark Lite", flush=True)
+                return fetch_spark_lite_answer(question, args)
+            raise
+    return fetch_spark_lite_answer(question, args)
 
 
 def compact_tts_text(text: str, max_chars: int) -> str:
@@ -1194,7 +1565,7 @@ def parse_command(text: str) -> Command | None:
         return Command("handshake", "收到，握手")
     if has_any(text, ("站起来", "起立", "站立", "恢复", "复位", "起来")):
         return Command("stand", "收到，站起来")
-    if is_weather_request(text):
+    if LOCAL_WEATHER_ENABLED and is_weather_request(text):
         city = extract_weather_city(text)
         if city:
             return Command("weather", text=city)
@@ -1226,6 +1597,7 @@ def execute_command(robot: DogzillaVoiceRobot, command: Command, args: argparse.
         robot.speak(command.reply)
 
     if name == "stop":
+        stop_other_robot_tasks(args)
         robot.stop()
     elif name == "sit":
         robot.action(12, seconds=args.action_seconds)
@@ -1249,7 +1621,7 @@ def execute_command(robot: DogzillaVoiceRobot, command: Command, args: argparse.
         try:
             answer = fetch_spark_answer(command.text, args)
         except Exception as exc:
-            print("[SPARK] error:", repr(exc), flush=True)
+            print("[CHAT] error: {!r}".format(exc), flush=True)
             answer = "这个问题我暂时回答失败了"
         robot.speak(answer)
     elif name == "music_play":
@@ -1323,10 +1695,44 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--weather-lon", type=float, default=DEFAULT_WEATHER_LON)
     parser.add_argument("--weather-timeout", type=float, default=5.0)
     parser.add_argument(
+        "--qwen-chat",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="answer non-command speech with Qwen/Bailian when QWEN_API_KEY is set",
+    )
+    parser.add_argument("--qwen-api-key", default=QWEN_API_KEY)
+    parser.add_argument("--qwen-api-base", default=QWEN_API_BASE)
+    parser.add_argument("--qwen-model", default=QWEN_MODEL)
+    parser.add_argument("--qwen-system-prompt", default=QWEN_SYSTEM_PROMPT)
+    parser.add_argument("--qwen-temperature", type=float, default=0.45)
+    parser.add_argument("--qwen-max-tokens", type=int, default=180)
+    parser.add_argument("--qwen-timeout", type=float, default=10.0)
+    parser.add_argument("--qwen-search-timeout", type=float, default=25.0)
+    parser.add_argument("--qwen-max-reply-chars", type=int, default=110)
+    parser.add_argument("--qwen-min-chars", type=int, default=2)
+    parser.add_argument(
+        "--qwen-web-search",
+        action=argparse.BooleanOptionalAction,
+        default=QWEN_WEB_SEARCH,
+        help="use web search for Qwen/Bailian fallback answers",
+    )
+    parser.add_argument(
+        "--qwen-always-search",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="force web search for every Qwen answer",
+    )
+    parser.add_argument(
+        "--qwen-question-only",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="only send clear questions or directed requests to Qwen in standalone mode",
+    )
+    parser.add_argument(
         "--spark-chat",
         action=argparse.BooleanOptionalAction,
         default=True,
-        help="answer non-command speech with Spark Lite when SPARK_API_PASSWORD is set",
+        help="enable voice Q&A; prefers Qwen when configured, otherwise Spark Lite",
     )
     parser.add_argument("--spark-api-password", default=SPARK_API_PASSWORD)
     parser.add_argument("--spark-api-url", default=SPARK_API_URL)
@@ -1347,6 +1753,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--tts-echo-similarity", type=float, default=0.72)
     parser.add_argument("--same-text-cooldown", type=float, default=4.0)
     parser.add_argument("--same-text-similarity", type=float, default=0.88)
+    parser.add_argument(
+        "--stop-kill-tasks",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="when hearing stop in standalone mode, terminate other robot task scripts",
+    )
+    parser.add_argument("--stop-kill-dirs", default=DEFAULT_STOP_KILL_DIRS)
+    parser.add_argument("--stop-kill-patterns", default=DEFAULT_STOP_KILL_PATTERNS)
+    parser.add_argument("--stop-kill-wait", type=float, default=0.35)
     parser.add_argument("--tts-backend", choices=("xunfei", "xgoedu"), default=os.getenv("DOGZILLA_TTS_BACKEND", "xunfei"))
     parser.add_argument("--tts-appid", default=XFYUN_TTS_APPID)
     parser.add_argument("--tts-api-key", default=XFYUN_TTS_API_KEY)
