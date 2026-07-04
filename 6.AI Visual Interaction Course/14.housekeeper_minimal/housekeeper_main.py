@@ -43,6 +43,33 @@ DEFAULT_SPARK_SYSTEM_PROMPT = (
     "除普通问答、背诗、讲故事、介绍知识外，目前可执行指令只有：坐下、握手、站起来、停止、前进、后退、左转、右转；"
     "问天气时需要用户说出城市。"
 )
+DEFAULT_QWEN_API_KEY = (
+    os.getenv("QWEN_API_KEY")
+    or os.getenv("DASHSCOPE_API_KEY")
+    or os.getenv("BAILIAN_API_KEY")
+    or ""
+)
+DEFAULT_QWEN_API_BASE = (
+    os.getenv("QWEN_API_BASE")
+    or os.getenv("DASHSCOPE_API_BASE")
+    or os.getenv("BAILIAN_API_BASE")
+    or "https://dashscope.aliyuncs.com/compatible-mode/v1"
+).rstrip("/")
+DEFAULT_QWEN_MODEL = os.getenv("QWEN_MODEL", "qwen-plus")
+DEFAULT_QWEN_WEB_SEARCH = os.getenv("QWEN_WEB_SEARCH", "1").strip().lower() not in (
+    "0",
+    "false",
+    "no",
+    "off",
+)
+DEFAULT_QWEN_SYSTEM_PROMPT = os.getenv(
+    "QWEN_SYSTEM_PROMPT",
+    "你是DOGZILLA Lite机器狗的语音助手。你运行在一只真实机器狗上。"
+    "请用中文口语化回答，简短自然，适合直接朗读；一般不超过90个汉字。"
+    "用户问实时信息、新闻、天气、比赛、价格、日期等内容时，要优先使用联网搜索结果。"
+    "不要编造你不能控制的功能。机器狗本地已经能执行停止、坐下、握手、站起来、前进、后退、左转、右转等动作，"
+    "这些动作由本地程序执行，你只负责其它问答、背诗、讲故事和知识解释。",
+)
 
 AUTH_RESULT_PATH = Path("/home/pi/xgoPictures/housekeeper/auth_result.json")
 GRAB_RESULT_PATH = Path("/home/pi/xgoPictures/ball_grab/grab_result.json")
@@ -237,7 +264,7 @@ def answer_voice_chat(text: str, args: argparse.Namespace, speaker: object | Non
     try:
         answer = voice_module.fetch_spark_answer(text, args)
     except Exception as exc:
-        print("[SPARK] error: {!r}".format(exc), flush=True)
+        print("[CHAT] error: {!r}".format(exc), flush=True)
         answer = "这个问题我暂时回答失败了"
     speak(speaker, answer)
     return True
@@ -695,8 +722,14 @@ class VoiceEventMonitor:
         if not (self.args.appid and self.args.api_key and self.args.api_secret):
             print("[VOICE] missing Xunfei credentials; voice events disabled", flush=True)
             return
-        if getattr(self.args, "spark_chat", True) and not getattr(self.args, "spark_api_password", ""):
-            print("[SPARK] missing SPARK_API_PASSWORD; voice Q&A disabled", flush=True)
+        if getattr(self.args, "spark_chat", True):
+            import voice_interaction
+
+            if not voice_interaction.chat_backend_available(self.args):
+                print(
+                    "[CHAT] missing QWEN_API_KEY or SPARK_API_PASSWORD; voice Q&A disabled",
+                    flush=True,
+                )
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
 
@@ -1105,7 +1138,41 @@ def build_parser() -> argparse.ArgumentParser:
         "--spark-chat",
         action=argparse.BooleanOptionalAction,
         default=True,
-        help="对非任务问句/请求启用 Spark Lite 问答",
+        help="对非任务问句/请求启用语音问答；优先 Qwen，未配置时回退 Spark Lite",
+    )
+    parser.add_argument(
+        "--qwen-chat",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="配置 QWEN_API_KEY 时优先使用 Qwen/Bailian 回答",
+    )
+    parser.add_argument("--qwen-api-key", default=DEFAULT_QWEN_API_KEY)
+    parser.add_argument("--qwen-api-base", default=DEFAULT_QWEN_API_BASE)
+    parser.add_argument("--qwen-model", default=DEFAULT_QWEN_MODEL)
+    parser.add_argument("--qwen-system-prompt", default=DEFAULT_QWEN_SYSTEM_PROMPT)
+    parser.add_argument("--qwen-temperature", type=float, default=0.45)
+    parser.add_argument("--qwen-max-tokens", type=int, default=180)
+    parser.add_argument("--qwen-timeout", type=float, default=10.0)
+    parser.add_argument("--qwen-search-timeout", type=float, default=25.0)
+    parser.add_argument("--qwen-max-reply-chars", type=int, default=110)
+    parser.add_argument("--qwen-min-chars", type=int, default=2)
+    parser.add_argument(
+        "--qwen-web-search",
+        action=argparse.BooleanOptionalAction,
+        default=DEFAULT_QWEN_WEB_SEARCH,
+        help="Qwen 回答时按需启用联网搜索",
+    )
+    parser.add_argument(
+        "--qwen-always-search",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="强制每次 Qwen 回答都联网搜索",
+    )
+    parser.add_argument(
+        "--qwen-question-only",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="只把明确问句或面向机器狗的请求发给 Qwen",
     )
     parser.add_argument("--spark-api-password", default=os.getenv("SPARK_API_PASSWORD", ""))
     parser.add_argument("--spark-api-url", default=os.getenv("SPARK_API_URL", DEFAULT_SPARK_API_URL))
