@@ -19,6 +19,8 @@ from typing import Callable, NamedTuple
 from echo_guard import EchoGuard
 from expression_feedback import ExpressionDisplay
 from housekeeper_config import ConfigError, HousekeeperConfig, load_config
+import music_dance
+from music_dance import default_music_dance_script
 from web_dashboard import DashboardServer, StatusBoard
 
 
@@ -107,25 +109,6 @@ MOTION_ONLY_KEYWORDS = (
 STOP_CONTROL_KEYWORDS = ("停止", "停下", "急停", "暂停", "别动")
 STOP_NEGATION_PATTERNS = ("别停", "不要停", "不用停", "不停")
 CONTINUE_CONTROL_KEYWORDS = ("继续", "恢复", "接着", "接着执行", "继续任务")
-MUSIC_PLAY_KEYWORDS = (
-    "放歌",
-    "播放音乐",
-    "播放歌曲",
-    "放音乐",
-    "听歌",
-    "来首歌",
-    "来一首歌",
-    "唱歌",
-)
-MUSIC_STOP_KEYWORDS = (
-    "停歌",
-    "停止播放",
-    "停止音乐",
-    "关音乐",
-    "关闭音乐",
-    "别放了",
-)
-SUPPORTED_MUSIC_EXTENSIONS = {".mp3", ".wav", ".m4a", ".aac", ".flac", ".ogg"}
 
 
 class HousekeeperTask(NamedTuple):
@@ -241,14 +224,7 @@ def parse_control_command(text: str) -> str | None:
 
 
 def parse_music_command(text: str) -> str | None:
-    cleaned = clean_text(text)
-    if not cleaned:
-        return None
-    if has_any(cleaned, MUSIC_STOP_KEYWORDS):
-        return "stop"
-    if has_any(cleaned, MUSIC_PLAY_KEYWORDS):
-        return "play"
-    return None
+    return music_dance.parse_music_command(text)
 
 
 def is_legacy_delivery_mode(delivery_task_mode: str) -> bool:
@@ -515,39 +491,19 @@ def build_music_player_command(
     loop: bool = False,
     action: str = "play",
 ) -> list[str]:
-    command = [
-        str(python_executable),
-        str(player_script),
-        "--music-dir",
-        str(music_dir),
-        "--volume",
-        str(max(0, min(100, int(volume)))),
-    ]
-    if action == "stop":
-        command.append("--stop")
-        return command
-    command.append("--background")
-    resolved_song = song or first_music_song_name(music_dir)
-    if resolved_song:
-        command.extend(["--song", resolved_song])
-    if loop:
-        command.append("--loop")
-    return command
+    return music_dance.build_music_player_command(
+        python_executable,
+        player_script,
+        music_dir=music_dir,
+        song=song,
+        volume=volume,
+        loop=loop,
+        action=action,
+    )
 
 
 def first_music_song_name(music_dir: Path) -> str:
-    try:
-        songs = sorted(
-            [
-                path
-                for path in music_dir.iterdir()
-                if path.is_file() and path.suffix.lower() in SUPPORTED_MUSIC_EXTENSIONS
-            ],
-            key=lambda path: path.name.lower(),
-        )
-    except OSError:
-        return ""
-    return songs[0].name if songs else ""
+    return music_dance.first_music_song_name(music_dir)
 
 
 def run_music_command(
@@ -559,33 +515,44 @@ def run_music_command(
 ) -> int:
     if action == "play":
         speak(speaker, "开始播放音乐")
-    command = build_music_player_command(
-        args.python,
-        args.music_player,
-        music_dir=args.music_dir,
-        song=args.music_song,
-        volume=args.music_volume,
-        loop=args.music_loop,
-        action=action,
-    )
+
+    def wrapped_runner(command, **kwargs):
+        kwargs.setdefault("env", build_child_env())
+        return runner(command, **kwargs)
+
     print("\n=== MUSIC_{} ===".format(action.upper()), flush=True)
-    print("COMMAND: {}".format(" ".join(command)), flush=True)
-    try:
-        result = runner(
-            command,
-            env=build_child_env(),
-            timeout=args.music_timeout,
-            check=False,
-        )
-    except Exception as exc:
-        print("[MUSIC] failed: {!r}".format(exc), flush=True)
-        speak(speaker, "音乐播放失败")
-        return 1
-    code = int(getattr(result, "returncode", 1))
+    code = music_dance.run_music_command(action, args, runner=wrapped_runner)
     if action == "stop" and code == 0:
-        speak(speaker, "已停止播放音乐")
+        speak(speaker, "已停止播放音乐和舞蹈")
     elif code != 0:
         speak(speaker, "音乐播放失败")
+    return code
+
+
+def run_music_dance_command(
+    action: str,
+    args: argparse.Namespace,
+    *,
+    speaker: object | None = None,
+    controller: RuntimeController | None = None,
+    runner: Callable[..., subprocess.CompletedProcess] = subprocess.run,
+) -> int:
+    if action == "play" and controller is not None and controller.has_active_process():
+        speak(speaker, "正在执行任务，不能跳舞")
+        return 1
+    if action == "play":
+        speak(speaker, "开始放歌跳舞")
+
+    def wrapped_runner(command, **kwargs):
+        kwargs.setdefault("env", build_child_env())
+        return runner(command, **kwargs)
+
+    print("\n=== MUSIC_DANCE_{} ===".format(action.upper()), flush=True)
+    code = music_dance.run_music_dance_command(action, args, runner=wrapped_runner)
+    if action == "stop" and code == 0:
+        speak(speaker, "已停止播放音乐和舞蹈")
+    elif code != 0:
+        speak(speaker, "放歌跳舞失败")
     return code
 
 
@@ -826,7 +793,15 @@ class VoiceEventMonitor:
                 print("Task heard from always-on voice: {}".format(event.value.summary()), flush=True)
                 self.controller.request_task(event.value)
             elif event.kind == "music" and isinstance(event.value, str):
-                run_music_command(event.value, self.args, speaker=self.controller.speaker)
+                if event.value == "dance":
+                    run_music_dance_command(
+                        "play",
+                        self.args,
+                        speaker=self.controller.speaker,
+                        controller=self.controller,
+                    )
+                else:
+                    run_music_command(event.value, self.args, speaker=self.controller.speaker)
 
 
 VoiceControlMonitor = VoiceEventMonitor
@@ -1161,6 +1136,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--grab-workflow-arg", action="append", default=[], help="透传给 grab_then_follow_line.py")
     parser.add_argument("--music-player", type=Path, default=DEFAULT_MUSIC_PLAYER)
     parser.add_argument("--music-dir", type=Path, default=DEFAULT_MUSIC_DIR)
+    parser.add_argument("--music-dance-script", type=Path, default=default_music_dance_script())
+    parser.add_argument("--music-dance-pid", type=Path, default=music_dance.DEFAULT_MUSIC_DANCE_PID)
+    parser.add_argument("--dance-actions", default="23,16,15")
+    parser.add_argument("--dance-action-seconds", type=float, default=3.0)
     parser.add_argument("--music-song", default="", help="默认播放歌曲名或关键词；空表示播放目录第一首")
     parser.add_argument("--music-volume", type=int, default=85)
     parser.add_argument("--music-loop", action="store_true")

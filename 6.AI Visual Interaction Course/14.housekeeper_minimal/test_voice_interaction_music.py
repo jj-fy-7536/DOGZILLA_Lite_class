@@ -22,8 +22,11 @@ class VoiceInteractionMusicTests(unittest.TestCase):
         play_music = voice_interaction.parse_command("播放音乐")
         self.assertEqual(play_music.name, "music_play")
 
-        stop_music = voice_interaction.parse_command("停歌")
-        self.assertEqual(stop_music.name, "music_stop")
+        stop_music_event = voice_interaction.parse_command("停歌")
+        self.assertEqual(stop_music_event.name, "music_stop")
+
+        dance = voice_interaction.parse_command("放歌跳舞")
+        self.assertEqual(dance.name, "music_dance")
 
         stop_robot = voice_interaction.parse_command("停止")
         self.assertEqual(stop_robot.name, "stop")

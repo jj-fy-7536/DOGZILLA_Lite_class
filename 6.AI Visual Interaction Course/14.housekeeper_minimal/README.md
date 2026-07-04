@@ -183,7 +183,8 @@ http://172.20.10.9:8091/
          以及"动词+球/方块/物品"组合句(捡/拣/见/拿/抓/找/送/取/提/带 + 目标物，含常见同音误识别)
 槽位解析: 红/绿/蓝/黄 + 客厅/station_A、门口/station_B、家/home
 运行控制: 停止/停下/急停/暂停/别动(带"别停/不要停"负向排除)，继续/恢复任务/接着执行
-音乐控制: 放歌/播放音乐/听歌 -> 调 `/home/pi/dogzilla_runs/dogzilla_music_player.py --background`；停歌/停止播放 -> 调 `--stop`
+音乐控制: 放歌/播放音乐/听歌 -> 调 `dogzilla_music_player.py --background`；停歌/停止播放 -> 停音乐并停舞
+放歌跳舞/边听边跳 -> 调 `dogzilla_music_dance.py --background`，循环预设动作 23/16/15（跳舞/摇摆/波浪）
 非任务问句/请求: 复用 `voice_interaction.py` 的问答过滤和 HTTP 调用（Qwen 优先，Spark 回退）
 ```
 
@@ -233,6 +234,7 @@ export SPARK_API_PASSWORD="你的Spark Lite密码"
 
 ```text
 /home/pi/dogzilla_runs/dogzilla_music_player.py
+/home/pi/dogzilla_runs/dogzilla_music_dance.py   # 也可直接用课程目录内脚本
 /home/pi/dogzilla_runs/music/
 ```
 

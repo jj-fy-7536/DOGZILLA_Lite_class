@@ -183,6 +183,39 @@ class HousekeeperMainTest(unittest.TestCase):
 
         self.assertIsNone(housekeeper_main.parse_voice_event("今天有点热"))
 
+    def test_voice_event_parses_music_dance_play(self):
+        event = housekeeper_main.parse_voice_event("边听边跳")
+        self.assertEqual(event.kind, "music")
+        self.assertEqual(event.value, "dance")
+
+    def test_run_music_dance_command_rejects_dance_while_workflow_active(self):
+        speaker = self.FakeSpeaker()
+        controller = housekeeper_main.RuntimeController(speaker=speaker)
+        controller.set_process(object())
+        args = argparse.Namespace(
+            python=Path("/python"),
+            music_player=Path("/player.py"),
+            music_dir=Path("/music"),
+            music_song="",
+            music_volume=80,
+            music_loop=False,
+            music_timeout=5.0,
+            music_dance_script=Path("/dance.py"),
+            music_dance_pid=Path("/tmp/music_dance.pid"),
+            dance_actions="23,16,15",
+            dance_action_seconds=3.0,
+        )
+
+        code = housekeeper_main.run_music_dance_command(
+            "play",
+            args,
+            speaker=speaker,
+            controller=controller,
+        )
+
+        self.assertEqual(code, 1)
+        self.assertEqual(speaker.messages, ["正在执行任务，不能跳舞"])
+
     def test_voice_event_parses_music_play_and_stop(self):
         play_event = housekeeper_main.parse_voice_event("放歌")
         self.assertEqual(play_event.kind, "music")

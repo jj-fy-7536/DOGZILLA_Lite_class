@@ -43,6 +43,21 @@ from wsgiref.handlers import format_date_time
 
 import websocket
 
+_SCRIPT_DIR = Path(__file__).resolve().parent
+if str(_SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(_SCRIPT_DIR))
+
+import music_dance
+from music_dance import (
+    build_music_dance_command,
+    build_music_player_command,
+    default_music_dance_script,
+    first_music_song_name,
+    parse_music_command,
+    run_music_command,
+    run_music_dance_command,
+)
+
 
 ROBOT_PATHS = ("/home/pi/RaspberryPi-CM5/app", "/home/pi/RaspberryPi-CM5/demos")
 for robot_path in ROBOT_PATHS:
@@ -119,7 +134,7 @@ DEFAULT_STOP_KILL_DIRS = os.getenv(
 )
 DEFAULT_STOP_KILL_PATTERNS = os.getenv(
     "DOGZILLA_STOP_KILL_PATTERNS",
-    "line_follow,follow_line,grab_then_follow_line,housekeeper_main,red_ball_grab,ball_grab,pick_up,pick_it_up",
+    "line_follow,follow_line,grab_then_follow_line,housekeeper_main,red_ball_grab,ball_grab,pick_up,pick_it_up,dogzilla_music_dance,music_dance",
 )
 
 STATUS_FIRST_FRAME = 0
@@ -830,102 +845,6 @@ def split_csv(text: str) -> tuple[str, ...]:
     return tuple(item.strip() for item in str(text).split(",") if item.strip())
 
 
-MUSIC_PLAY_KEYWORDS = (
-    "放歌",
-    "播放音乐",
-    "播放歌曲",
-    "放音乐",
-    "听歌",
-    "来首歌",
-    "来一首歌",
-    "唱歌",
-)
-MUSIC_STOP_KEYWORDS = (
-    "停歌",
-    "停止播放",
-    "停止音乐",
-    "关音乐",
-    "关闭音乐",
-    "别放了",
-)
-SUPPORTED_MUSIC_EXTENSIONS = {".mp3", ".wav", ".m4a", ".aac", ".flac", ".ogg"}
-
-
-def parse_music_command(text: str) -> str | None:
-    cleaned = clean_text(text)
-    if not cleaned:
-        return None
-    if has_any(cleaned, MUSIC_STOP_KEYWORDS):
-        return "stop"
-    if has_any(cleaned, MUSIC_PLAY_KEYWORDS):
-        return "play"
-    return None
-
-
-def build_music_player_command(
-    python_executable: Path,
-    player_script: Path,
-    *,
-    music_dir: Path = DEFAULT_DOGZILLA_MUSIC_DIR,
-    song: str = "",
-    volume: int = 85,
-    loop: bool = False,
-    action: str = "play",
-) -> list[str]:
-    command = [
-        str(python_executable),
-        str(player_script),
-        "--music-dir",
-        str(music_dir),
-        "--volume",
-        str(max(0, min(100, int(volume)))),
-    ]
-    if action == "stop":
-        command.append("--stop")
-        return command
-    command.append("--background")
-    resolved_song = song or first_music_song_name(music_dir)
-    if resolved_song:
-        command.extend(["--song", resolved_song])
-    if loop:
-        command.append("--loop")
-    return command
-
-
-def first_music_song_name(music_dir: Path) -> str:
-    try:
-        songs = sorted(
-            [
-                path
-                for path in music_dir.iterdir()
-                if path.is_file() and path.suffix.lower() in SUPPORTED_MUSIC_EXTENSIONS
-            ],
-            key=lambda path: path.name.lower(),
-        )
-    except OSError:
-        return ""
-    return songs[0].name if songs else ""
-
-
-def run_music_command(action: str, args: argparse.Namespace) -> int:
-    command = build_music_player_command(
-        Path(sys.executable),
-        Path(args.music_player),
-        music_dir=Path(args.music_dir),
-        song=args.music_song,
-        volume=args.music_volume,
-        loop=args.music_loop,
-        action=action,
-    )
-    print("[MUSIC] command:", " ".join(command), flush=True)
-    try:
-        result = subprocess.run(command, timeout=args.music_timeout, check=False)
-    except Exception as exc:
-        print("[MUSIC] failed:", repr(exc), flush=True)
-        return 1
-    return int(result.returncode)
-
-
 CHAT_IGNORED_TEXTS = {
     "嗯",
     "啊",
@@ -1548,6 +1467,8 @@ def parse_command(text: str) -> Command | None:
         return None
 
     music = parse_music_command(text)
+    if music == "dance":
+        return Command("music_dance")
     if music == "play":
         return Command("music_play")
     if music == "stop":
@@ -1624,6 +1545,14 @@ def execute_command(robot: DogzillaVoiceRobot, command: Command, args: argparse.
             print("[CHAT] error: {!r}".format(exc), flush=True)
             answer = "这个问题我暂时回答失败了"
         robot.speak(answer)
+    elif name == "music_dance":
+        robot.speak("开始放歌跳舞")
+        if robot.dry_run:
+            print("[DRY] music dance", flush=True)
+            return True
+        code = run_music_dance_command("play", args)
+        if code != 0:
+            robot.speak("放歌跳舞失败")
     elif name == "music_play":
         robot.speak("开始播放音乐")
         if robot.dry_run:
@@ -1638,7 +1567,7 @@ def execute_command(robot: DogzillaVoiceRobot, command: Command, args: argparse.
             return True
         code = run_music_command("stop", args)
         if code == 0:
-            robot.speak("已停止播放音乐")
+            robot.speak("已停止播放音乐和舞蹈")
         else:
             robot.speak("停止音乐失败")
     elif name == "forward":
@@ -1685,6 +1614,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--action-seconds", type=float, default=0.2)
     parser.add_argument("--music-player", default=str(DEFAULT_MUSIC_PLAYER))
     parser.add_argument("--music-dir", default=str(DEFAULT_DOGZILLA_MUSIC_DIR))
+    parser.add_argument("--music-dance-script", default=str(default_music_dance_script()))
+    parser.add_argument("--music-dance-pid", default=str(music_dance.DEFAULT_MUSIC_DANCE_PID))
+    parser.add_argument("--dance-actions", default="23,16,15")
+    parser.add_argument("--dance-action-seconds", type=float, default=3.0)
     parser.add_argument("--music-song", default="", help="song filename or keyword; empty means first song")
     parser.add_argument("--music-volume", type=int, default=85)
     parser.add_argument("--music-loop", action="store_true")
