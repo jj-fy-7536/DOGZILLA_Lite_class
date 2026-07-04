@@ -1,0 +1,48 @@
+{
+  "defaults": {
+    "color": "red",
+    "target_station": "station_A"
+  },
+  "colors": {
+    "red": {
+      "label": "红球",
+      "aliases": ["红", "红色", "红球", "红色方块"]
+    },
+    "green": {
+      "label": "绿球",
+      "aliases": ["绿", "绿色", "绿球", "绿色方块"]
+    },
+    "blue": {
+      "label": "蓝球",
+      "aliases": ["蓝", "蓝色", "蓝球", "蓝色方块"]
+    },
+    "yellow": {
+      "label": "黄球",
+      "aliases": ["黄", "黄色", "黄球", "黄色方块"]
+    }
+  },
+  "stations": {
+    "home": {
+      "label": "待命区",
+      "aliases": ["家", "回家", "起点", "待命区"]
+    },
+    "station_A": {
+      "label": "客厅",
+      "aliases": ["客厅", "A点", "站点A", "stationA", "station_A"]
+    },
+    "station_B": {
+      "label": "门口",
+      "aliases": ["门口", "门边", "B点", "站点B", "stationB", "station_B"]
+    }
+  },
+  "return_home": {
+    "enabled": true,
+    "turn_speed": 20,
+    "turn_seconds": 2.4,
+    "timeout_seconds": 90
+  },
+  "line": {
+    "qr_decode_every_frames": 3,
+    "result_path": "/home/pi/xgoPictures/housekeeper/line_result.json"
+  }
+}

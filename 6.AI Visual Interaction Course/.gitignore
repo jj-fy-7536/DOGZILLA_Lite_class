@@ -1,0 +1,18 @@
+__pycache__/
+*.py[cod]
+*.pyo
+.DS_Store
+.ipynb_checkpoints/
+
+# Local credentials / launch wrappers with plaintext passwords.
+*.exp
+.env
+*.env
+
+# Runtime/debug outputs should stay outside source control.
+*.log
+*.tmp
+*.jpg
+*.jpeg
+*.png
+*.mp4
