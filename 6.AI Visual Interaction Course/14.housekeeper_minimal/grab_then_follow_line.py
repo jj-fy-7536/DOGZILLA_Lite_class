@@ -9,6 +9,7 @@ import os
 import signal
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 from typing import NamedTuple
@@ -366,6 +367,67 @@ def build_child_env(base_env: dict[str, str] | None = None) -> dict[str, str]:
     return env
 
 
+_active_child: subprocess.Popen | None = None
+_active_child_lock = threading.Lock()
+_interrupt_handlers_installed = False
+
+
+def set_active_child(process: subprocess.Popen | None) -> None:
+    global _active_child
+    with _active_child_lock:
+        _active_child = process
+
+
+def terminate_child_process(
+    process: subprocess.Popen,
+    *,
+    grace_seconds: float = 3.0,
+) -> bool:
+    if process.poll() is not None:
+        return True
+    try:
+        process.send_signal(signal.SIGINT)
+        process.wait(timeout=grace_seconds)
+        return True
+    except subprocess.TimeoutExpired:
+        process.terminate()
+        try:
+            process.wait(timeout=grace_seconds)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait()
+        return False
+
+
+def terminate_active_child(*, grace_seconds: float = 3.0) -> bool:
+    global _active_child
+    with _active_child_lock:
+        process = _active_child
+    if process is None:
+        return True
+    graceful = terminate_child_process(process, grace_seconds=grace_seconds)
+    with _active_child_lock:
+        if _active_child is process:
+            _active_child = None
+    return graceful
+
+
+def install_workflow_interrupt_handlers() -> None:
+    global _interrupt_handlers_installed
+    if _interrupt_handlers_installed:
+        return
+
+    def handle_interrupt(signum: int, _frame) -> None:
+        print("\n[INTERRUPT] stopping workflow children", flush=True)
+        terminate_active_child()
+        stop_robot_motion()
+        raise SystemExit(128 + signum)
+
+    signal.signal(signal.SIGINT, handle_interrupt)
+    signal.signal(signal.SIGTERM, handle_interrupt)
+    _interrupt_handlers_installed = True
+
+
 def run_process(
     name: str,
     command: list[str],
@@ -379,25 +441,19 @@ def run_process(
         cwd=str(cwd) if cwd is not None else None,
         env=build_child_env(),
     )
+    set_active_child(process)
     try:
         return process.wait(timeout=timeout_seconds)
     except subprocess.TimeoutExpired:
         print("{} reached timeout; stopping it.".format(name))
-        process.send_signal(signal.SIGINT)
-        try:
-            return process.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            process.kill()
-            return process.wait()
+        terminate_child_process(process)
+        return process.wait()
     except KeyboardInterrupt:
         print("\nKeyboardInterrupt; stopping {}.".format(name))
-        process.send_signal(signal.SIGINT)
-        try:
-            process.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            process.kill()
-            process.wait()
+        terminate_child_process(process)
         raise
+    finally:
+        set_active_child(None)
 
 
 def stop_robot_motion() -> None:
@@ -752,6 +808,7 @@ def main() -> int:
     )
     args = parser.parse_args()
 
+    install_workflow_interrupt_handlers()
     paths = resolve_paths(args.course_dir)
     for label, path in (
         ("grab script", paths.grab_script),

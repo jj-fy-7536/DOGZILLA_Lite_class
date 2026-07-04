@@ -1,5 +1,6 @@
 import importlib.util
 import json
+import signal
 import sys
 import tempfile
 import unittest
@@ -419,6 +420,27 @@ class GrabThenFollowLineTests(unittest.TestCase):
 
         env = grab_then_follow_line.build_child_env({"DISPLAY": ":1"})
         self.assertEqual(env["DISPLAY"], ":1")
+
+    def test_run_process_tracks_and_terminates_active_child(self):
+        class FakeProcess:
+            def __init__(self):
+                self.signals = []
+                self._code = None
+
+            def poll(self):
+                return self._code
+
+            def wait(self, timeout=None):
+                return 0
+
+            def send_signal(self, signum):
+                self.signals.append(signum)
+
+        fake = FakeProcess()
+        grab_then_follow_line.set_active_child(fake)
+        self.assertTrue(grab_then_follow_line.terminate_active_child())
+        self.assertEqual(fake.signals, [signal.SIGINT])
+        self.assertIsNone(grab_then_follow_line._active_child)
 
 
 if __name__ == "__main__":

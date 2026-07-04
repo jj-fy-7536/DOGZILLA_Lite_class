@@ -329,6 +329,7 @@ class HousekeeperMainTest(unittest.TestCase):
         controller = housekeeper_main.RuntimeController()
         task = housekeeper_main.HousekeeperTask("grab_then_follow_line", "开始任务")
 
+        controller.prepare_for_task_listen()
         controller.request_task(task)
         received = controller.wait_for_task(timeout_seconds=0.1)
 
@@ -403,8 +404,107 @@ class HousekeeperMainTest(unittest.TestCase):
         self.assertIn("green", command)
         self.assertIn("--task-mode", command)
         self.assertIn("qr", command)
-        self.assertIn("--return-home", command)
+        self.assertNotIn("--return-home", command)
         self.assertEqual(command[-1], "--stream-grab")
+
+    def test_build_grab_workflow_command_adds_return_home_only_for_legacy_mode(self):
+        task = housekeeper_main.HousekeeperTask.for_request(
+            raw_text="把红球送到门口",
+            requested_color="red",
+            effective_color="red",
+            target_station="station_B",
+            station_label="门口",
+            color_label="红球",
+        )
+        legacy_command = housekeeper_main.build_grab_workflow_command(
+            Path("/python"),
+            Path("/course/14.housekeeper_minimal"),
+            task=task,
+            return_home=True,
+            delivery_task_mode="legacy",
+        )
+        self.assertIn("--return-home", legacy_command)
+
+    def test_spoken_summary_for_delivery_mode_mentions_task_qr(self):
+        task = housekeeper_main.HousekeeperTask.for_request(
+            raw_text="把红球送到门口",
+            requested_color="red",
+            effective_color="red",
+            target_station="station_B",
+            station_label="门口",
+            color_label="红球",
+        )
+        self.assertIn("任务二维码", task.spoken_summary_for_mode("qr"))
+        self.assertIn("门口", task.spoken_summary_for_mode("legacy"))
+
+    def test_runtime_controller_ignores_task_before_listen_stage(self):
+        controller = housekeeper_main.RuntimeController()
+        task = housekeeper_main.HousekeeperTask("grab_then_follow_line", "开始任务")
+
+        controller.request_task(task)
+        received = controller.wait_for_task(timeout_seconds=0.01)
+        self.assertIsNone(received)
+
+        controller.prepare_for_task_listen()
+        controller.request_task(task)
+        received = controller.wait_for_task(timeout_seconds=0.1)
+        self.assertEqual(received, task)
+
+    def test_run_sequence_loops_for_next_task_when_enabled(self):
+        calls = []
+        listen_results = [
+            housekeeper_main.HousekeeperTask("grab_then_follow_line", "开始任务"),
+            housekeeper_main.HousekeeperTask("grab_then_follow_line", "去捡球"),
+        ]
+
+        class DoneTesting(Exception):
+            pass
+
+        def auth():
+            calls.append("auth")
+            return True
+
+        def listen_twice():
+            calls.append("listen")
+            if not listen_results:
+                raise DoneTesting()
+            return listen_results.pop(0)
+
+        def run_task(_task):
+            calls.append("task")
+
+        speaker = self.FakeSpeaker()
+        with self.assertRaises(DoneTesting):
+            housekeeper_main.run_sequence(
+                auth,
+                listen_twice,
+                run_task,
+                speaker=speaker,
+                loop_tasks=True,
+            )
+
+        self.assertEqual(calls, ["auth", "listen", "task", "listen", "task", "listen"])
+        self.assertIn("等待下一个任务", speaker.messages)
+
+    def test_answer_voice_chat_works_with_qwen_only_backend(self):
+        speaker = self.FakeSpeaker()
+
+        class QwenOnlyModule:
+            def should_use_spark_chat(self, text, args):
+                return bool(getattr(args, "qwen_api_key", ""))
+
+            def fetch_spark_answer(self, question, args):
+                return "这是 Qwen 的回答。"
+
+        handled = housekeeper_main.answer_voice_chat(
+            "中国首都是哪里？",
+            argparse.Namespace(qwen_api_key="qwen-key", spark_api_password=""),
+            speaker,
+            voice_module=QwenOnlyModule(),
+        )
+
+        self.assertTrue(handled)
+        self.assertEqual(speaker.messages, ["这是 Qwen 的回答。"])
 
     def test_run_sequence_calls_stages_in_order(self):
         calls = []
@@ -429,7 +529,14 @@ class HousekeeperMainTest(unittest.TestCase):
         self.assertEqual(calls, ["auth", "listen", "task"])
         self.assertEqual(
             speaker.messages,
-            ["开始识别人脸", "人脸识别成功", "开始听语音指令", "收到,去拿红球送到客厅", "开始执行捡球任务", "任务完成"],
+            [
+                "开始识别人脸",
+                "人脸识别成功",
+                "开始听语音指令",
+                "收到,去拿红球,出发前请扫任务二维码",
+                "开始执行捡球任务",
+                "任务完成",
+            ],
         )
 
     def test_run_sequence_stops_when_owner_not_confirmed(self):

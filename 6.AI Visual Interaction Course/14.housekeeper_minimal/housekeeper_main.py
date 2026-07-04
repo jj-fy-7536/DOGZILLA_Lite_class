@@ -76,6 +76,7 @@ GRAB_RESULT_PATH = Path("/home/pi/xgoPictures/ball_grab/grab_result.json")
 
 EXIT_AUTH_FAILED = 10
 EXIT_NO_TASK = 11
+LEGACY_DELIVERY_MODE = "legacy"
 
 TASK_TRIGGER_KEYWORDS = (
     "开始任务",
@@ -168,6 +169,16 @@ class HousekeeperTask(NamedTuple):
     def spoken_summary(self) -> str:
         return "收到,去拿{}送到{}".format(self.color_label, self.station_label)
 
+    def spoken_summary_for_mode(self, delivery_task_mode: str) -> str:
+        if is_legacy_delivery_mode(delivery_task_mode):
+            return self.spoken_summary()
+        return "收到,去拿{},出发前请扫任务二维码".format(self.color_label)
+
+    def dashboard_summary_for_mode(self, delivery_task_mode: str) -> str:
+        if is_legacy_delivery_mode(delivery_task_mode):
+            return self.summary()
+        return "{} / 任务二维码".format(self.color_label)
+
     def capability_notice(self) -> str:
         if self.color_downgraded:
             return "我现在只会拿红球,先按红球执行"
@@ -238,6 +249,10 @@ def parse_music_command(text: str) -> str | None:
     if has_any(cleaned, MUSIC_PLAY_KEYWORDS):
         return "play"
     return None
+
+
+def is_legacy_delivery_mode(delivery_task_mode: str) -> bool:
+    return str(delivery_task_mode or "").strip().lower() == LEGACY_DELIVERY_MODE
 
 
 def parse_voice_event(text: str, config: HousekeeperConfig | None = None) -> VoiceEvent | None:
@@ -471,7 +486,7 @@ def build_grab_workflow_command(
         command.extend(["--line-result", str(line_result)])
     if qr_decode_every_frames > 0:
         command.extend(["--qr-decode-every-frames", str(qr_decode_every_frames)])
-    if return_home:
+    if return_home and is_legacy_delivery_mode(delivery_task_mode):
         command.extend(
             [
                 "--return-home",
@@ -636,6 +651,25 @@ class RuntimeController:
         self._current_process: subprocess.Popen[str] | None = None
         self._stop_generation = 0
         self._handled_stop_generation = 0
+        self._accept_tasks = False
+
+    def set_accept_tasks(self, accept: bool) -> None:
+        with self._task_condition:
+            self._accept_tasks = accept
+
+    def accepts_tasks(self) -> bool:
+        with self._task_condition:
+            return self._accept_tasks
+
+    def clear_pending_task(self) -> None:
+        with self._task_condition:
+            self._pending_task = None
+
+    def prepare_for_task_listen(self) -> None:
+        with self._task_condition:
+            self._pending_task = None
+            self._accept_tasks = True
+            self._task_condition.notify_all()
 
     def set_process(self, process: subprocess.Popen[str]) -> None:
         with self._lock:
@@ -673,6 +707,9 @@ class RuntimeController:
 
     def request_task(self, task: HousekeeperTask) -> None:
         with self._task_condition:
+            if not self._accept_tasks:
+                print("[VOICE] ignored task before listen stage: {}".format(task.summary()), flush=True)
+                return
             self._pending_task = task
             self._task_condition.notify_all()
 
@@ -1035,7 +1072,12 @@ def run_sequence(
     run_task: Callable[[HousekeeperTask], int],
     speaker: object | None = None,
     controller: RuntimeController | None = None,
+    *,
+    loop_tasks: bool = False,
+    delivery_task_mode: str = "qr",
 ) -> int:
+    if controller is not None:
+        controller.set_accept_tasks(False)
     while True:
         if controller is not None:
             controller.wait_while_paused()
@@ -1053,44 +1095,49 @@ def run_sequence(
     show_expression(speaker, "happy")
     speak(speaker, "人脸识别成功")
 
+    code = 0
     while True:
         if controller is not None:
             controller.wait_while_paused()
+            controller.prepare_for_task_listen()
         set_stage(speaker, "LISTEN")
         show_expression(speaker, "listen")
         speak(speaker, "开始听语音指令")
         task = listen_for_task()
-        if task is not None:
-            break
-        if wait_after_global_stop(controller):
-            continue
-        show_expression(speaker, "fail")
-        speak(speaker, "没有收到任务")
-        return EXIT_NO_TASK
+        if task is None:
+            if wait_after_global_stop(controller):
+                continue
+            show_expression(speaker, "fail")
+            speak(speaker, "没有收到任务")
+            return EXIT_NO_TASK
 
-    while True:
         if controller is not None:
-            controller.wait_while_paused()
-        set_stage(speaker, "TASK")
-        show_expression(speaker, "work")
-        notice = task.capability_notice()
-        if notice:
-            speak(speaker, notice)
-        speak(speaker, task.spoken_summary())
-        speak(speaker, "开始执行捡球任务")
-        code = run_task(task)
-        if code != 0 and wait_after_global_stop(controller):
-            continue
-        break
+            controller.set_accept_tasks(False)
+        while True:
+            if controller is not None:
+                controller.wait_while_paused()
+            set_stage(speaker, "TASK")
+            show_expression(speaker, "work")
+            notice = task.capability_notice()
+            if notice:
+                speak(speaker, notice)
+            speak(speaker, task.spoken_summary_for_mode(delivery_task_mode))
+            speak(speaker, "开始执行捡球任务")
+            code = run_task(task)
+            if code != 0 and wait_after_global_stop(controller):
+                continue
+            break
 
-    set_stage(speaker, "DONE")
-    if code == 0:
-        show_expression(speaker, "success")
-        speak(speaker, "任务完成")
-    else:
-        show_expression(speaker, "fail")
-        speak(speaker, "任务失败")
-    return code
+        set_stage(speaker, "DONE")
+        if code == 0:
+            show_expression(speaker, "success")
+            speak(speaker, "任务完成")
+        else:
+            show_expression(speaker, "fail")
+            speak(speaker, "任务失败")
+        if not loop_tasks:
+            return code
+        speak(speaker, "等待下一个任务")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -1104,6 +1151,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--voice-timeout", type=float, default=120.0)
     parser.add_argument("--voice-retry-delay", type=float, default=1.0)
     parser.add_argument("--dry-voice", action="store_true", help="从终端输入模拟语音文本")
+    parser.add_argument("--once", action="store_true", help="只执行一轮任务后退出；默认会持续等待新任务")
     parser.add_argument("--line-seconds", type=float, default=0.0)
     parser.add_argument("--delivery-task-mode", default="qr", help="传给 grab_then_follow_line.py 的任务模式")
     parser.add_argument("--disable-return-home", action="store_true", help="到站后不执行返航")
@@ -1286,7 +1334,7 @@ def main() -> int:
             target_color=args.target_color,
             target_station=args.target_station,
         )
-        board.set_task(task.summary())
+        board.set_task(task.dashboard_summary_for_mode(args.delivery_task_mode))
         grab_command = build_grab_workflow_command(
             args.python,
             housekeeper_dir,
@@ -1322,6 +1370,8 @@ def main() -> int:
             run_task,
             speaker=speaker,
             controller=controller,
+            loop_tasks=not args.once,
+            delivery_task_mode=args.delivery_task_mode,
         )
     finally:
         monitor.stop()
